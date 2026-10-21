@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffprobe_kit.dart';
@@ -67,9 +68,32 @@ String fmtDur(double seconds) {
   return '$m:$r';
 }
 
+String durLabel(int s) {
+  if (s < 60) return '$s ثانية';
+  final m = s ~/ 60;
+  final r = s % 60;
+  return r == 0 ? '$m دقيقة' : '$m د و $r ث';
+}
+
 String formatSize(int bytes) {
   if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+/// فحص مرن لنوع الستريم (بيتعامل مع اختلاف إصدارات الباكيدج)
+bool isAudioStream(dynamic s) {
+  try {
+    dynamic t = s.getType();
+    t ??= s.getStringProperty('codec_type');
+    if (t != null && t.toString().toLowerCase() == 'audio') return true;
+    final codec = (s.getCodec() ?? '').toString().toLowerCase();
+    return const [
+      'aac', 'mp3', 'opus', 'vorbis', 'flac', 'ac3', 'eac3', 'alac',
+      'amr_nb', 'amr_wb', 'pcm_s16le', 'pcm_s16be', 'pcm_u8'
+    ].contains(codec);
+  } catch (_) {
+    return false;
+  }
 }
 
 class SourceVideo {
@@ -77,6 +101,7 @@ class SourceVideo {
   final String name;
   double duration;
   bool hasAudio;
+  bool noAudio = false; // اتأكدنا فعلاً إن الصوت مش بيشتغل مع الفيديو ده
   bool analyzed = false;
   List<double> scores = []; // درجة اهتمام كل ثانية (0..1)
   List<double> cuts = []; // أوقات تغيّر المشهد
@@ -107,6 +132,33 @@ class ClipPlan {
   });
 }
 
+// ───────────────────── الستايلات (20 ستايل + بدون + مزيج) ─────────────────────
+
+const Map<String, String> kStyleNames = {
+  'none': 'بدون',
+  'cinematic': 'سينمائي',
+  'vivid': 'حيوي',
+  'warm': 'دافئ',
+  'cool': 'بارد',
+  'bw': 'أبيض وأسود',
+  'noir': 'نوار درامي',
+  'vintage': 'قديم',
+  'sepia': 'سيبيا',
+  'tealorange': 'تيل وبرتقالي',
+  'neon': 'نيون',
+  'dreamy': 'حالم',
+  'faded': 'باهت مات',
+  'sunset': 'غروب',
+  'forest': 'طبيعة خضراء',
+  'pink': 'وردي',
+  'cyber': 'سايبر',
+  'film': 'فيلم قديم',
+  'hdr': 'HDR قوي',
+  'golden': 'ذهبي',
+  'bluemono': 'أزرق أحادي',
+  'mix': '🎲 مزيج (ستايل لكل مقطع)',
+};
+
 String gradeFor(String style) {
   switch (style) {
     case 'cinematic':
@@ -115,12 +167,75 @@ String gradeFor(String style) {
       return 'eq=contrast=1.08:saturation=1.35:brightness=0.01,unsharp=5:5:0.7';
     case 'warm':
       return 'colorbalance=rm=0.07:gm=0.01:bm=-0.07:rh=0.05:bh=-0.05,eq=saturation=1.12:contrast=1.04,vignette=PI/6';
+    case 'cool':
+      return 'colorbalance=rs=-0.06:bs=0.10:rm=-0.04:bm=0.06:bh=0.04,eq=saturation=1.05:contrast=1.04,vignette=PI/6';
     case 'bw':
       return 'hue=s=0,eq=contrast=1.25:brightness=-0.02,vignette=PI/5,noise=alls=5:allf=t';
+    case 'noir':
+      return 'hue=s=0,eq=contrast=1.55:brightness=-0.05,vignette=PI/3.5,noise=alls=6:allf=t';
+    case 'vintage':
+      return 'curves=preset=vintage,eq=saturation=0.9:contrast=1.03,vignette=PI/5,noise=alls=7:allf=t';
+    case 'sepia':
+      return 'colorchannelmixer=rr=.393:rg=.769:rb=.189:gr=.349:gg=.686:gb=.168:br=.272:bg=.534:bb=.131,vignette=PI/6';
+    case 'tealorange':
+      return 'colorbalance=rs=-0.10:bs=0.12:rm=-0.03:bm=0.04:rh=0.12:bh=-0.10,eq=contrast=1.1:saturation=1.2';
+    case 'neon':
+      return 'eq=contrast=1.18:saturation=1.75:brightness=-0.02,colorbalance=bs=0.10:bm=0.06:rh=0.06,unsharp=5:5:0.6';
+    case 'dreamy':
+      return 'gblur=sigma=1.0,eq=brightness=0.04:saturation=1.1:contrast=0.96,colorbalance=rh=0.05:bh=0.05';
+    case 'faded':
+      return 'eq=contrast=0.88:saturation=0.78:brightness=0.04,colorbalance=rs=0.02:bs=0.03';
+    case 'sunset':
+      return 'colorbalance=rs=0.12:gs=0.02:bs=-0.10:rm=0.08:bm=-0.08:rh=0.06:bh=-0.05,eq=saturation=1.25:contrast=1.05,vignette=PI/6';
+    case 'forest':
+      return 'colorbalance=rs=-0.04:gs=0.08:bs=-0.03:gm=0.05,eq=saturation=1.2:contrast=1.05';
+    case 'pink':
+      return 'colorbalance=rm=0.08:gm=-0.04:bm=0.06:rh=0.04:bh=0.04,eq=saturation=1.15:brightness=0.02';
+    case 'cyber':
+      return 'colorbalance=rs=0.10:gs=-0.08:bs=0.15:rh=0.10:bh=0.10,eq=contrast=1.2:saturation=1.5';
+    case 'film':
+      return 'curves=preset=cross_process,eq=saturation=0.95,noise=alls=12:allf=t,vignette=PI/5';
+    case 'hdr':
+      return 'eq=contrast=1.25:saturation=1.3:brightness=0.01,unsharp=5:5:1.0';
+    case 'golden':
+      return 'colorbalance=rm=0.10:gm=0.04:bm=-0.12:rh=0.06:bh=-0.06,eq=saturation=1.2:contrast=1.04,vignette=PI/6';
+    case 'bluemono':
+      return 'hue=s=0.15,colorbalance=bs=0.20:bm=0.20:bh=0.12:rs=-0.10:rm=-0.12,eq=contrast=1.1';
     default:
       return '';
   }
 }
+
+// ───────────────────── الانتقالات ─────────────────────
+
+const List<String> kSmoothTr = [
+  'fade', 'dissolve', 'fadeblack', 'fadewhite', 'fadegrays',
+  'smoothleft', 'smoothright', 'smoothup', 'smoothdown', 'distance',
+];
+
+const List<String> kDynamicTr = [
+  'wipeleft', 'wiperight', 'wipeup', 'wipedown',
+  'slideleft', 'slideright', 'slideup', 'slidedown',
+  'circleopen', 'circleclose', 'circlecrop', 'rectcrop',
+  'vertopen', 'vertclose', 'horzopen', 'horzclose',
+  'radial', 'diagtl', 'diagtr', 'diagbl', 'diagbr', 'pixelize',
+  'hlslice', 'hrslice', 'vuslice', 'vdslice', 'hblur',
+  'wipetl', 'wipetr', 'wipebl', 'wipebr',
+  'squeezeh', 'squeezev', 'zoomin',
+  'hlwind', 'hrwind', 'vuwind', 'vdwind',
+  'coverleft', 'coverright', 'coverup', 'coverdown',
+  'revealleft', 'revealright', 'revealup', 'revealdown',
+];
+
+/// انتقالات مضمونة في الإصدارات القديمة من FFmpeg
+const Set<String> kSafeTr = {
+  'fade', 'dissolve', 'fadeblack', 'fadewhite', 'wipeleft', 'wiperight',
+  'wipeup', 'wipedown', 'slideleft', 'slideright', 'slideup', 'slidedown',
+  'circleopen', 'circleclose', 'circlecrop', 'rectcrop', 'vertopen',
+  'vertclose', 'horzopen', 'horzclose', 'radial', 'smoothleft',
+  'smoothright', 'smoothup', 'smoothdown', 'distance', 'pixelize',
+  'diagtl', 'diagtr', 'diagbl', 'diagbr',
+};
 
 /// صور مصغرة للمونتاجات المحفوظة
 class ThumbService {
@@ -408,13 +523,15 @@ class ProjectPage extends StatefulWidget {
 class _ProjectPageState extends State<ProjectPage> {
   final _picker = ImagePicker();
   final List<SourceVideo> _sources = [];
+  final _textCtrl = TextEditingController();
 
   int _targetSec = 30;
+  int _pace = 1; // 0 سريع / 1 متوسط / 2 هادئ
   String _aspect = '9:16';
   bool _hd = false;
   bool _smart = true;
   String _style = 'cinematic';
-  bool _smoothTransitions = false;
+  int _trMode = 1; // 0 ناعمة / 1 متنوعة / 2 كل الأنواع
   bool _blurFit = false;
   bool _slowmo = true;
   bool _pan = true;
@@ -422,28 +539,59 @@ class _ProjectPageState extends State<ProjectPage> {
   String? _musicPath;
   String? _musicName;
 
+  // الكتابة على الفيديو
+  bool _textOn = false;
+  String _textPos = 'bottom';
+  String _textSize = 'm';
+  String _textColor = 'white';
+  bool _textBox = true;
+  int _textTiming = 0; // 0 طوال الفيديو / 1 أول 5 ثواني / 2 آخر 5 ثواني
+
   bool _busy = false;
   bool _picking = false;
   bool _cancelled = false;
   double _progress = 0;
   String _status = '';
+  String _errorDetail = '';
+  String _lastLog = '';
 
   static const double _td = 0.5; // مدة الانتقال
+  static const int _group = 8; // أقصى عدد مقاطع في عملية دمج واحدة
   String? _encInter;
   String? _encFinal;
 
-  static const _styles = {
-    'cinematic': 'سينمائي',
-    'vivid': 'حيوي',
-    'warm': 'دافئ',
-    'bw': 'أبيض وأسود',
-    'none': 'بدون',
-  };
+  // حالة التجهيز
+  final Map<String, String> _gradeOf = {};
+  List<String> _mixOrder = ['none'];
+  Set<String> _supportedTr = {};
+  bool _trReady = false;
+
+  // تقدّم الدمج
+  int _stepsDone = 0;
+  int _stepsTotal = 1;
+  double _mStart = 0;
+  double _mW = 1;
+
   static const _aspects = {
     '9:16': 'ريلز 9:16',
     '16:9': 'يوتيوب 16:9',
     '1:1': 'مربع 1:1',
   };
+  static const _textPosNames = {'top': 'أعلى', 'center': 'وسط', 'bottom': 'أسفل'};
+  static const _textSizeNames = {'s': 'صغير', 'm': 'متوسط', 'l': 'كبير'};
+  static const Map<String, Color> _textColors = {
+    'white': Colors.white,
+    'yellow': Color(0xFFFFE14D),
+    'pink': kAccent,
+    'green': Color(0xFF6BFF8A),
+    'cyan': Color(0xFF4DE1FF),
+  };
+
+  @override
+  void dispose() {
+    _textCtrl.dispose();
+    super.dispose();
+  }
 
   void _toast(String msg) {
     if (!mounted) return;
@@ -463,6 +611,11 @@ class _ProjectPageState extends State<ProjectPage> {
     setState(() => _progress = p.clamp(0.0, 1.0).toDouble());
   }
 
+  void _tick(double f) {
+    final total = max(1, _stepsTotal);
+    _setP(_mStart + _mW * ((_stepsDone + f) / total));
+  }
+
   // ───── اختيار الفيديوهات والموسيقى ─────
 
   Future<SourceVideo?> _probe(XFile x) async {
@@ -474,7 +627,7 @@ class _ProjectPageState extends State<ProjectPage> {
       if (info != null) {
         duration = double.tryParse(info.getDuration() ?? '') ?? 0;
         final streams = info.getStreams();
-        hasAudio = streams.any((s) => s.getType() == 'audio');
+        hasAudio = streams.isEmpty ? true : streams.any(isAudioStream);
       }
     } catch (_) {}
     if (duration <= 0) {
@@ -529,13 +682,19 @@ class _ProjectPageState extends State<ProjectPage> {
 
   Future<bool> _exec(String cmd, {void Function(int ms)? onTime}) async {
     final c = Completer<bool>();
+    var tail = '';
     await FFmpegKit.executeAsync(
       cmd,
       (session) async {
         final code = await session.getReturnCode();
-        c.complete(ReturnCode.isSuccess(code));
+        final ok = ReturnCode.isSuccess(code);
+        if (!ok) _lastLog = tail;
+        c.complete(ok);
       },
-      null,
+      (log) {
+        tail += '${log.getMessage()}\n';
+        if (tail.length > 6000) tail = tail.substring(tail.length - 3000);
+      },
       onTime == null ? null : (s) => onTime(s.getTime().toInt()),
     );
     return c.future;
@@ -548,6 +707,16 @@ class _ProjectPageState extends State<ProjectPage> {
       return (d != null && d > 0) ? d : null;
     } catch (_) {
       return null;
+    }
+  }
+
+  Future<bool> _hasAudioStream(String path) async {
+    try {
+      final s = await FFprobeKit.getMediaInformation(path);
+      final streams = s.getMediaInformation()?.getStreams() ?? [];
+      return streams.any(isAudioStream);
+    } catch (_) {
+      return false;
     }
   }
 
@@ -625,6 +794,28 @@ class _ProjectPageState extends State<ProjectPage> {
 
   // ───── التخطيط: اختيار اللحظات ─────
 
+  (double, double) _paceRange() {
+    switch (_pace) {
+      case 0:
+        return (1.5, 2.6);
+      case 2:
+        return (3.0, 6.0);
+      default:
+        return (1.8, 3.5);
+    }
+  }
+
+  double _availableSec() {
+    final (lo, hi) = _paceRange();
+    var sum = 0.0;
+    for (final s in _sources) {
+      if (s.duration >= lo + 0.1) {
+        sum += max(1, (s.duration / (hi + 0.5)).floor()) * ((lo + hi) / 2 - _td);
+      }
+    }
+    return sum;
+  }
+
   bool _overlaps(List<List<double>> used, double s, double e) {
     return used.any((u) => s < u[1] + 0.3 && e > u[0] - 0.3);
   }
@@ -650,29 +841,30 @@ class _ProjectPageState extends State<ProjectPage> {
   }
 
   List<ClipPlan> _plan(Random rng) {
+    final (lo, hi) = _paceRange();
     final usable = <int>[];
     for (var i = 0; i < _sources.length; i++) {
-      if (_sources[i].duration >= 1.8) usable.add(i);
+      if (_sources[i].duration >= lo + 0.1) usable.add(i);
     }
     if (usable.isEmpty) return [];
 
     // 1) أطوال المقاطع
     final lens = <double>[];
     var total = 0.0;
-    while (total < _targetSec && lens.length < 60) {
-      final len = 1.8 + rng.nextDouble() * 1.7;
+    while (total < _targetSec && lens.length < 900) {
+      final len = lo + rng.nextDouble() * (hi - lo);
       total += lens.isEmpty ? len : len - _td;
       lens.add(len);
     }
     if (lens.length > 1 && total > _targetSec) {
-      lens[lens.length - 1] = max(1.8, lens.last - (total - _targetSec));
+      lens[lens.length - 1] = max(lo, lens.last - (total - _targetSec));
     }
 
     // 2) توزيع المقاطع على الفيديوهات (بوزن مدة كل فيديو)
     final assigned = <int, List<double>>{};
     for (final len in lens) {
       final cands = usable
-          .where((i) => (assigned[i]?.length ?? 0) < max(1, (_sources[i].duration / 4).floor()))
+          .where((i) => (assigned[i]?.length ?? 0) < max(1, (_sources[i].duration / (hi + 0.5)).floor()))
           .toList();
       if (cands.isEmpty) break;
       final sumW = cands.fold<double>(0, (a, i) => a + _sources[i].duration);
@@ -732,7 +924,7 @@ class _ProjectPageState extends State<ProjectPage> {
     if (_slowmo && plans.length >= 4) {
       final idx = List<int>.generate(plans.length, (i) => i)
         ..sort((a, b) => plans[b].score.compareTo(plans[a].score));
-      final n = min(3, max(1, plans.length ~/ 6));
+      final n = max(1, plans.length ~/ 8);
       for (final i in idx.take(n)) {
         final p = plans[i];
         p.start = p.start + p.len * 0.25;
@@ -749,6 +941,91 @@ class _ProjectPageState extends State<ProjectPage> {
       plans.shuffle(rng);
     }
     return plans;
+  }
+
+  // ───── الستايلات والانتقالات ─────
+
+  Future<void> _prepareStyles(Random rng) async {
+    _gradeOf.clear();
+    final keys = _style == 'mix'
+        ? kStyleNames.keys.where((k) => k != 'none' && k != 'mix').toList()
+        : <String>[_style];
+    final good = <String>[];
+    for (final k in keys) {
+      final g = gradeFor(k);
+      if (g.isEmpty) {
+        _gradeOf[k] = '';
+        good.add(k);
+        continue;
+      }
+      // نجرّب الستايل على لقطة صغيرة قبل ما نعتمد عليه
+      final ok = await _exec(
+        '-y -f lavfi -i color=c=gray:s=320x180:r=10:d=0.4 -vf "$g,format=yuv420p" -frames:v 2 -f null -',
+      );
+      if (ok) {
+        _gradeOf[k] = g;
+        good.add(k);
+      }
+    }
+    if (_style == 'mix') {
+      good.shuffle(rng);
+      if (good.isEmpty) {
+        _gradeOf['none'] = '';
+        _mixOrder = ['none'];
+      } else {
+        _mixOrder = good;
+      }
+    }
+  }
+
+  String _styleForClip(int idx) {
+    if (_style == 'mix') return _mixOrder[idx % _mixOrder.length];
+    return _style;
+  }
+
+  Future<void> _detectTransitions() async {
+    if (_trReady) return;
+    final help = await _runForLogs('-hide_banner -h filter=xfade', null);
+    final found = <String>{};
+    if (help != null) {
+      final re = RegExp(r'^\s+([a-z0-9]+)\s+-?\d+\s', multiLine: true);
+      for (final m in re.allMatches(help)) {
+        found.add(m.group(1)!);
+      }
+    }
+    _supportedTr = found;
+    _trReady = true;
+  }
+
+  List<String> _trPool() {
+    final List<String> base;
+    if (_trMode == 0) {
+      base = kSmoothTr;
+    } else if (_trMode == 1) {
+      base = kDynamicTr;
+    } else {
+      base = [...kSmoothTr, ...kDynamicTr];
+    }
+    List<String> f;
+    if (_supportedTr.length >= 5) {
+      f = base.where(_supportedTr.contains).toList();
+    } else {
+      f = base.where(kSafeTr.contains).toList();
+    }
+    return f.isEmpty ? ['fade'] : f;
+  }
+
+  List<String> _pickTransitions(int count, Random rng) {
+    final pool = _trPool();
+    final out = <String>[];
+    while (out.length < count) {
+      final s = List<String>.from(pool)..shuffle(rng);
+      if (out.isNotEmpty && s.length > 1 && s.first == out.last) {
+        s.add(s.removeAt(0));
+      }
+      out.addAll(s);
+    }
+    return out.take(count).toList();
   }
 
   // ───── الترميز ─────
@@ -799,10 +1076,11 @@ class _ProjectPageState extends State<ProjectPage> {
     int outW,
     int outH, {
     required bool fancy,
+    required bool audio,
   }) async {
     final v = _sources[p.source];
     final len = p.len.toStringAsFixed(3);
-    final grade = fancy ? gradeFor(_style) : '';
+    final grade = fancy ? (_gradeOf[_styleForClip(idx)] ?? '') : '';
     final speed = p.slow ? 'setpts=2.0*PTS,' : '';
     final big = fancy && _pan && !_blurFit;
 
@@ -812,9 +1090,9 @@ class _ProjectPageState extends State<ProjectPage> {
 
     String vf;
     if (_blurFit) {
-      vf = '[0:v]${speed}fps=30,split=2[a][b];'
-          '[a]scale=$outW:$outH:force_original_aspect_ratio=increase,crop=$outW:$outH,boxblur=25:5[bg];'
-          '[b]scale=$outW:$outH:force_original_aspect_ratio=decrease[fg];'
+      vf = '[0:v]${speed}fps=30,split=2[sa][sb];'
+          '[sa]scale=$outW:$outH:force_original_aspect_ratio=increase,crop=$outW:$outH,boxblur=25:5[bg];'
+          '[sb]scale=$outW:$outH:force_original_aspect_ratio=decrease[fg];'
           '[bg][fg]overlay=(W-w)/2:(H-h)/2,$post[v]';
     } else if (big) {
       final sw = (outW * 1.15 / 2).round() * 2;
@@ -845,98 +1123,252 @@ class _ProjectPageState extends State<ProjectPage> {
           'crop=$outW:$outH,$post[v]';
     }
 
-    final useAudio = fancy && _keepOriginal && v.hasAudio && !p.slow;
+    final useAudio = audio && !p.slow;
     final af = useAudio
-        ? '[0:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a]'
-        : 'anullsrc=r=44100:cl=stereo,atrim=duration=$len,asetpts=PTS-STARTPTS[a]';
+        ? '[0:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,'
+            'atrim=duration=$len,asetpts=PTS-STARTPTS[aud]'
+        : 'anullsrc=r=44100:cl=stereo,atrim=duration=$len,asetpts=PTS-STARTPTS[aud]';
 
     final cmd = '-y -ss ${p.start.toStringAsFixed(3)} -t ${p.srcLen.toStringAsFixed(3)} '
-        '-i "${v.path}" -filter_complex "$vf;$af" -map "[v]" -map "[a]" -t $len '
+        '-i "${v.path}" -filter_complex "$vf;$af" -map "[v]" -map "[aud]" -t $len '
         '$_encInter -c:a aac -b:a 192k -ar 44100 -ac 2 "$out"';
     return _exec(cmd);
   }
 
-  Future<bool> _concat(
-    List<String> clipFiles,
-    List<double> lens,
-    String out,
-    double total,
-    Random rng,
-    void Function(double) onP,
-  ) async {
-    final n = clipFiles.length;
-    final inputs = StringBuffer();
-    for (final f in clipFiles) {
-      inputs.write('-i "$f" ');
-    }
-    final hasMusic = _musicPath != null;
-    if (hasMusic) inputs.write('-stream_loop -1 -i "$_musicPath" ');
-
-    const smooth = ['fade', 'dissolve', 'fadeblack'];
-    const dynamic = [
-      'fade',
-      'wipeleft',
-      'wiperight',
-      'slideleft',
-      'slideright',
-      'circleopen',
-      'dissolve',
-      'fadeblack',
-      'smoothleft',
-      'smoothright',
-      'radial',
-      'fadewhite',
-      'circleclose',
-    ];
-    final pool = _smoothTransitions ? smooth : dynamic;
-
+  /// يبني جزء الدمج بالانتقالات (فيديو xfade + صوت acrossfade)
+  ({List<String> fc, String v, String a}) _chain(int n, List<double> lens, List<String> trs) {
     final fc = <String>[];
-
-    // الفيديو: سلسلة xfade
+    for (var k = 0; k < n; k++) {
+      fc.add('[$k:v]fps=30,format=yuv420p,setsar=1[nv$k]');
+      fc.add('[$k:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[na$k]');
+    }
     var acc = 0.0;
     for (var k = 1; k < n; k++) {
       acc += lens[k - 1];
       final offset = acc - k * _td;
-      final tr = pool[rng.nextInt(pool.length)];
-      final inA = k == 1 ? '[0:v]' : '[v${k - 1}]';
-      fc.add('$inA[$k:v]xfade=transition=$tr:duration=$_td:offset=${offset.toStringAsFixed(3)}[v$k]');
+      final inV = k == 1 ? '[nv0]' : '[v${k - 1}]';
+      final inA = k == 1 ? '[na0]' : '[a${k - 1}]';
+      fc.add('$inV[nv$k]xfade=transition=${trs[k - 1]}:duration=$_td:offset=${offset.toStringAsFixed(3)}[v$k]');
+      fc.add('$inA[na$k]acrossfade=d=$_td[a$k]');
     }
-    final lastV = n == 1 ? '[0:v]' : '[v${n - 1}]';
-    final fadeOutStart = (total - 0.7).toStringAsFixed(3);
-    fc.add('${lastV}fade=t=in:st=0:d=0.5,fade=t=out:st=$fadeOutStart:d=0.7,format=yuv420p[vout]');
+    return (
+      fc: fc,
+      v: n == 1 ? '[nv0]' : '[v${n - 1}]',
+      a: n == 1 ? '[na0]' : '[a${n - 1}]',
+    );
+  }
 
-    // الصوت
-    final useOrig = _keepOriginal;
-    String? aLabel;
-    if (useOrig) {
-      for (var k = 1; k < n; k++) {
-        final inA = k == 1 ? '[0:a]' : '[a${k - 1}]';
-        fc.add('$inA[$k:a]acrossfade=d=$_td[a$k]');
+  /// دمج مجموعة مقاطع في ملف وسيط
+  Future<bool> _mergeGroup(List<String> files, List<double> lens, String out, Random rng) async {
+    final n = files.length;
+    final expected = lens.fold<double>(0, (a, b) => a + b) - (n - 1) * _td;
+
+    String build(List<String> trs) {
+      final c = _chain(n, lens, trs);
+      final inputs = files.map((f) => '-i "$f"').join(' ');
+      final fc = [...c.fc, '${c.v}null[vout]', '${c.a}anull[aout]'].join(';');
+      return '-y $inputs -filter_complex "$fc" -map "[vout]" -map "[aout]" '
+          '$_encInter -c:a aac -b:a 192k -ar 44100 -ac 2 "$out"';
+    }
+
+    void prog(int ms) => _tick((ms / (max(0.5, expected) * 1000)).clamp(0.0, 1.0).toDouble());
+
+    var ok = await _exec(build(_pickTransitions(n - 1, rng)), onTime: prog);
+    if (!ok && !_cancelled) {
+      ok = await _exec(build(List<String>.filled(n - 1, 'fade')), onTime: prog);
+    }
+    return ok;
+  }
+
+  int _mergeSteps(int n) {
+    var steps = 1;
+    var c = n;
+    while (c > _group) {
+      final g = (c / _group).ceil();
+      steps += g;
+      c = g;
+    }
+    return steps;
+  }
+
+  /// يدمج المقاطع على مستويات لحد ما يبقى عدد صغير (للمونتاجات الطويلة)
+  Future<(List<String>, List<double>)?> _reduce(
+    List<String> files,
+    List<double> lens,
+    String dir,
+    Random rng,
+  ) async {
+    var cur = files;
+    var curL = lens;
+    var level = 0;
+    while (cur.length > _group) {
+      final next = <String>[];
+      final nextL = <double>[];
+      final groups = (cur.length / _group).ceil();
+      for (var g = 0; g < groups; g++) {
+        if (_cancelled) return null;
+        final s = g * _group;
+        final e = min(cur.length, s + _group);
+        final sf = cur.sublist(s, e);
+        final sl = curL.sublist(s, e);
+        if (sf.length == 1) {
+          next.add(sf[0]);
+          nextL.add(sl[0]);
+          continue;
+        }
+        _set('دمج المجموعة ${g + 1}/$groups (مستوى ${level + 1})…',
+            _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
+        final out = '$dir/m${level}_$g.mp4';
+        final ok = await _mergeGroup(sf, sl, out, rng);
+        if (!ok) return null;
+        final d = await _durationOf(out) ??
+            (sl.fold<double>(0, (a, b) => a + b) - (sl.length - 1) * _td);
+        for (final f in sf) {
+          try {
+            File(f).deleteSync();
+          } catch (_) {}
+        }
+        next.add(out);
+        nextL.add(d);
+        _stepsDone++;
+        _tick(0);
       }
-      aLabel = n == 1 ? '[0:a]' : '[a${n - 1}]';
+      cur = next;
+      curL = nextL;
+      level++;
     }
+    return (cur, curL);
+  }
 
+  /// الدمج النهائي: انتقالات + كتابة + موسيقى + فيد
+  Future<bool> _finalize({
+    required List<String> files,
+    required List<double> lens,
+    required String out,
+    required double total,
+    required Random rng,
+    required bool useOrig,
+    String? textPng,
+  }) async {
+    final n = files.length;
+    final hasMusic = _musicPath != null;
+    final hasText = textPng != null;
+    final musicIdx = n;
+    final textIdx = hasMusic ? n + 1 : n;
     final totalStr = total.toStringAsFixed(3);
-    final aFadeOut = 'afade=t=out:st=${(total - 1.2).toStringAsFixed(3)}:d=1.2';
-    if (hasMusic && useOrig) {
-      fc.add('${aLabel!}volume=0.35[o]');
-      fc.add('[$n:a]atrim=0:$totalStr,asetpts=PTS-STARTPTS,afade=t=in:d=1[m]');
-      fc.add('[o][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,$aFadeOut[aout]');
-    } else if (hasMusic) {
-      fc.add('[$n:a]atrim=0:$totalStr,asetpts=PTS-STARTPTS,afade=t=in:d=1,$aFadeOut[aout]');
-    } else if (useOrig) {
-      fc.add('${aLabel!}$aFadeOut[aout]');
+
+    String build(List<String> trs) {
+      final c = _chain(n, lens, trs);
+      final fc = <String>[...c.fc];
+      final inputs = StringBuffer();
+      for (final f in files) {
+        inputs.write('-i "$f" ');
+      }
+      if (hasMusic) inputs.write('-stream_loop -1 -i "$_musicPath" ');
+      if (hasText) inputs.write('-loop 1 -framerate 30 -i "$textPng" ');
+
+      var vLabel = c.v;
+      if (hasText) {
+        var enable = '';
+        if (_textTiming == 1) {
+          enable = ":enable='lt(t,5)'";
+        } else if (_textTiming == 2) {
+          enable = ":enable='gt(t,${max(0.0, total - 5).toStringAsFixed(3)})'";
+        }
+        fc.add('[$textIdx:v]format=rgba[tx]');
+        fc.add('$vLabel[tx]overlay=0:0$enable[vt]');
+        vLabel = '[vt]';
+      }
+      final fadeOutStart = max(0.0, total - 0.7).toStringAsFixed(3);
+      fc.add('${vLabel}fade=t=in:st=0:d=0.5,fade=t=out:st=$fadeOutStart:d=0.7,format=yuv420p[vout]');
+
+      final aFade = 'afade=t=out:st=${max(0.0, total - 1.2).toStringAsFixed(3)}:d=1.2';
+      var hasAudioOut = true;
+      if (hasMusic && useOrig) {
+        fc.add('${c.a}volume=0.35[o]');
+        fc.add('[$musicIdx:a]atrim=0:$totalStr,asetpts=PTS-STARTPTS,afade=t=in:d=1[m]');
+        fc.add('[o][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,$aFade[aout]');
+      } else if (hasMusic) {
+        fc.add('[$musicIdx:a]atrim=0:$totalStr,asetpts=PTS-STARTPTS,afade=t=in:d=1,$aFade[aout]');
+      } else if (useOrig) {
+        fc.add('${c.a}$aFade[aout]');
+      } else {
+        hasAudioOut = false;
+      }
+
+      final audioArgs = hasAudioOut ? '-map "[aout]" -c:a aac -b:a 192k -ar 44100 -ac 2' : '-an';
+      return '-y ${inputs.toString()}-filter_complex "${fc.join(';')}" -map "[vout]" $audioArgs '
+          '-t $totalStr $_encFinal -movflags +faststart "$out"';
     }
 
-    final hasAudioOut = hasMusic || useOrig;
-    final audioArgs = hasAudioOut ? '-map "[aout]" -c:a aac -b:a 192k' : '-an';
-    final inputStr = inputs.toString();
-    final filterStr = fc.join(';');
+    void prog(int ms) => _tick((ms / (max(0.5, total) * 1000)).clamp(0.0, 1.0).toDouble());
 
-    final cmd = '-y $inputStr-filter_complex "$filterStr" -map "[vout]" $audioArgs '
-        '-t $totalStr $_encFinal -movflags +faststart "$out"';
+    final trs = n > 1 ? _pickTransitions(n - 1, rng) : <String>[];
+    var ok = await _exec(build(trs), onTime: prog);
+    if (!ok && !_cancelled && n > 1) {
+      ok = await _exec(build(List<String>.filled(n - 1, 'fade')), onTime: prog);
+    }
+    return ok;
+  }
 
-    return _exec(cmd, onTime: (ms) => onP((ms / (total * 1000)).clamp(0.0, 1.0).toDouble()));
+  // ───── الكتابة على الفيديو (صورة شفافة بتتعمل بفلاتر → بتدعم العربي) ─────
+
+  Future<String?> _makeTextPng(String path, int w, int h) async {
+    try {
+      final text = _textCtrl.text.trim();
+      if (text.isEmpty) return null;
+      final isRtl = RegExp(r'[\u0600-\u06FF]').hasMatch(text);
+      final base = min(w, h).toDouble();
+      final factor = _textSize == 's' ? 0.045 : (_textSize == 'l' ? 0.09 : 0.065);
+      final fs = base * factor;
+      final color = _textColors[_textColor] ?? Colors.white;
+
+      final tp = TextPainter(
+        text: TextSpan(
+          text: text,
+          style: TextStyle(
+            color: color,
+            fontSize: fs,
+            fontWeight: FontWeight.w800,
+            height: 1.3,
+            shadows: const [Shadow(color: Colors.black, blurRadius: 6, offset: Offset(0, 2))],
+          ),
+        ),
+        textAlign: TextAlign.center,
+        textDirection: isRtl ? TextDirection.rtl : TextDirection.ltr,
+      )..layout(maxWidth: w * 0.84);
+
+      final rec = ui.PictureRecorder();
+      final canvas = Canvas(rec, Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()));
+      final dx = (w - tp.width) / 2;
+      double dy;
+      if (_textPos == 'top') {
+        dy = h * 0.10;
+      } else if (_textPos == 'center') {
+        dy = (h - tp.height) / 2;
+      } else {
+        dy = h * 0.84 - tp.height;
+      }
+      if (_textBox) {
+        final pad = fs * 0.5;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(dx - pad, dy - pad * 0.6, tp.width + pad * 2, tp.height + pad * 1.2),
+            Radius.circular(pad),
+          ),
+          Paint()..color = const Color.fromARGB(140, 0, 0, 0),
+        );
+      }
+      tp.paint(canvas, Offset(dx, dy));
+      final pic = rec.endRecording();
+      final img = await pic.toImage(w, h);
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (bd == null) return null;
+      await File(path).writeAsBytes(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
+      return path;
+    } catch (_) {
+      return null;
+    }
   }
 
   // ───── التشغيل الكامل ─────
@@ -951,6 +1383,7 @@ class _ProjectPageState extends State<ProjectPage> {
       _cancelled = false;
       _progress = 0;
       _status = 'جاري التجهيز…';
+      _errorDetail = '';
     });
 
     await FlutterForegroundTask.startService(
@@ -965,10 +1398,12 @@ class _ProjectPageState extends State<ProjectPage> {
 
     String? resultPath;
     try {
+      final warns = <String>[];
+
       // 1) التحليل
       final needAnalysis = _smart && _sources.any((s) => !s.analyzed);
-      final aW = needAnalysis ? 0.25 : 0.0;
-      final cW = needAnalysis ? 0.5 : 0.7;
+      final aW = needAnalysis ? 0.15 : 0.0;
+      const cW = 0.55;
 
       if (needAnalysis) {
         for (var i = 0; i < _sources.length; i++) {
@@ -984,47 +1419,115 @@ class _ProjectPageState extends State<ProjectPage> {
       _set('جاري اختيار أفضل اللحظات…', aW);
       final plans = _plan(rng);
       if (plans.isEmpty) throw 'تعذر اختيار مقاطع، جرّب فيديوهات أطول';
+      final plannedTotal = plans.fold<double>(0, (a, p) => a + p.len) - (plans.length - 1) * _td;
+      if (plannedTotal < _targetSec * 0.85) {
+        warns.add(
+            'المدة الناتجة حوالي ${durLabel(plannedTotal.round())} لأن الفيديوهات المختارة مش كفاية للمدة المطلوبة.');
+      }
 
-      // 3) تجهيز المقاطع
+      // 3) تجهيز الأدوات
+      _set('تجهيز الأدوات والستايلات…', aW);
       await _detectEncoder();
+      await _detectTransitions();
+      await _prepareStyles(rng);
+      if (_cancelled) throw 'cancel';
+
       final (outW, outH) = _outputSize();
+
+      // 4) تجهيز المقاطع
       final clipFiles = <String>[];
       final lens = <double>[];
+      var anyRealAudio = false;
       for (var i = 0; i < plans.length; i++) {
         if (_cancelled) throw 'cancel';
         _set('تجهيز المقطع ${i + 1}/${plans.length} وإضافة اللمسات…', aW + cW * i / plans.length);
+        final p = plans[i];
+        final v = _sources[p.source];
         final out = '${tmp.path}/clip_$i.mp4';
-        var ok = await _renderClip(plans[i], i, out, outW, outH, fancy: true);
-        if (!ok && !_cancelled) {
-          ok = await _renderClip(plans[i], i, out, outW, outH, fancy: false);
+        final tryAudio = !v.noAudio && !p.slow;
+        final attempts = <List<bool>>[
+          if (tryAudio) [true, true],
+          if (tryAudio) [false, true],
+          [true, false],
+          [false, false],
+        ];
+        var ok = false;
+        var gotAudio = false;
+        for (final a in attempts) {
+          if (_cancelled) break;
+          ok = await _renderClip(p, i, out, outW, outH, fancy: a[0], audio: a[1]);
+          if (ok) {
+            gotAudio = a[1];
+            break;
+          }
         }
         if (_cancelled) throw 'cancel';
         if (ok) {
+          if (gotAudio) {
+            anyRealAudio = true;
+          } else if (tryAudio) {
+            v.noAudio = true;
+          }
           clipFiles.add(out);
-          lens.add(await _durationOf(out) ?? plans[i].len);
+          lens.add(await _durationOf(out) ?? p.len);
         }
       }
       if (clipFiles.isEmpty) throw 'فشل تجهيز المقاطع';
+      if (clipFiles.length < plans.length) {
+        warns.add('${plans.length - clipFiles.length} مقطع اتخطّى بسبب خطأ في المعالجة.');
+      }
 
-      // 4) الدمج النهائي
-      final total = lens.fold<double>(0, (a, b) => a + b) - (lens.length - 1) * _td;
+      // 5) الدمج على مستويات
+      _stepsTotal = _mergeSteps(clipFiles.length);
+      _stepsDone = 0;
+      _mStart = aW + cW;
+      _mW = 1 - _mStart;
+      final red = await _reduce(clipFiles, lens, tmp.path, rng);
+      if (_cancelled) throw 'cancel';
+      if (red == null) throw 'فشل دمج المقاطع';
+      final (finalFiles, finalLens) = red;
+      final total = finalLens.fold<double>(0, (a, b) => a + b) - (finalLens.length - 1) * _td;
+
+      // 6) الكتابة
+      String? textPng;
+      if (_textOn && _textCtrl.text.trim().isNotEmpty) {
+        textPng = await _makeTextPng('${tmp.path}/text.png', outW, outH);
+        if (textPng == null) warns.add('تعذر إنشاء الكتابة على الفيديو.');
+      }
+
+      // 7) الدمج النهائي
       final dir = await montagesDir();
       final outPath = '${dir.path}/montage_${DateTime.now().millisecondsSinceEpoch}.mp4';
-      _set('دمج المقاطع وإضافة الانتقالات والموسيقى…', aW + cW);
-      final ok = await _concat(
-        clipFiles,
-        lens,
-        outPath,
-        total,
-        rng,
-        (f) => _setP(aW + cW + (1 - aW - cW) * f),
+      _set('الدمج النهائي (انتقالات + كتابة + موسيقى)…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
+      final useOrig = _keepOriginal && anyRealAudio;
+      final ok = await _finalize(
+        files: finalFiles,
+        lens: finalLens,
+        out: outPath,
+        total: total,
+        rng: rng,
+        useOrig: useOrig,
+        textPng: textPng,
       );
       if (_cancelled) throw 'cancel';
       if (!ok) throw 'فشل الدمج النهائي';
 
+      // 8) فحص الصوت
+      final wantAudio = useOrig || _musicPath != null;
+      if (wantAudio && !await _hasAudioStream(outPath)) {
+        warns.add('ما قدرتش أتأكد إن الصوت موجود في الملف النهائي.');
+      }
+      if (_keepOriginal && !anyRealAudio) {
+        warns.add(_musicPath == null
+            ? 'الفيديوهات الأصلية مفيهاش صوت (أو تعذر قراءته)، فالمونتاج صامت. ضيف موسيقى لو عايز صوت.'
+            : 'الفيديوهات الأصلية مفيهاش صوت، اتستخدمت الموسيقى بس.');
+      }
+
       resultPath = outPath;
-      _set('تم! المونتاج جاهز 🎉', 1);
+      final msg = 'تم! المونتاج جاهز 🎉${warns.isEmpty ? '' : '\n⚠️ ${warns.join('\n⚠️ ')}'}';
+      _set(msg, 1);
     } catch (e) {
+      if (e != 'cancel' && mounted) setState(() => _errorDetail = _lastLog);
       _set(e == 'cancel' ? 'تم الإلغاء' : 'حدث خطأ: $e', 0);
     } finally {
       await FlutterForegroundTask.stopService();
@@ -1090,8 +1593,16 @@ class _ProjectPageState extends State<ProjectPage> {
     );
   }
 
+  Widget _sub(String t) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 10, bottom: 6),
+      child: Text(t, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final avail = _availableSec();
     return PopScope(
       canPop: !_busy,
       child: Scaffold(
@@ -1109,11 +1620,41 @@ class _ProjectPageState extends State<ProjectPage> {
                     children: [
                       _section('1) الفيديوهات', _buildSources()),
                       _section(
-                        '2) مدة المونتاج',
-                        _chips<int>([15, 30, 45, 60], _targetSec, (v) => '$v ثانية', (v) => _targetSec = v),
+                        '2) مدة المونتاج: ${durLabel(_targetSec)}',
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Directionality(
+                              textDirection: TextDirection.ltr,
+                              child: Slider(
+                                min: 10,
+                                max: 600,
+                                divisions: 118,
+                                value: _targetSec.toDouble().clamp(10.0, 600.0).toDouble(),
+                                label: durLabel(_targetSec),
+                                activeColor: kAccent,
+                                onChanged: (v) => setState(() => _targetSec = (v / 5).round() * 5),
+                              ),
+                            ),
+                            _chips<int>([15, 30, 60, 120, 180, 300], _targetSec, durLabel, (v) => _targetSec = v),
+                            if (_sources.isNotEmpty && _targetSec > avail * 0.95)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: Text(
+                                  '⚠️ الفيديوهات المختارة تكفي تقريباً لـ ${durLabel(avail.round())} بس. '
+                                  'زوّد فيديوهات أو اختار إيقاع "هادئ".',
+                                  style: const TextStyle(fontSize: 11, color: kAccent2),
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
                       _section(
-                        '3) الشكل والجودة',
+                        '3) إيقاع القطع',
+                        _chips<int>([0, 1, 2], _pace, (v) => const ['سريع', 'متوسط', 'هادئ'][v], (v) => _pace = v),
+                      ),
+                      _section(
+                        '4) الشكل والجودة',
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
@@ -1124,19 +1665,24 @@ class _ProjectPageState extends State<ProjectPage> {
                         ),
                       ),
                       _section(
-                        '4) طريقة اختيار اللحظات',
+                        '5) طريقة اختيار اللحظات',
                         _chips<bool>([true, false], _smart, (v) => v ? 'ذكي (صوت وحركة)' : 'عشوائي', (v) => _smart = v),
                       ),
                       _section(
-                        '5) الستايل (اللمسة السحرية)',
-                        _chips<String>(_styles.keys.toList(), _style, (v) => _styles[v]!, (v) => _style = v),
+                        '6) الستايل (اللمسة السحرية)',
+                        _chips<String>(kStyleNames.keys.toList(), _style, (v) => kStyleNames[v]!, (v) => _style = v),
                       ),
                       _section(
-                        '6) الانتقالات',
-                        _chips<bool>([true, false], _smoothTransitions, (v) => v ? 'ناعمة' : 'متنوعة', (v) => _smoothTransitions = v),
+                        '7) الانتقالات',
+                        _chips<int>(
+                          [0, 1, 2],
+                          _trMode,
+                          (v) => const ['ناعمة', 'متنوعة', 'كل الأنواع'][v],
+                          (v) => _trMode = v,
+                        ),
                       ),
                       _section(
-                        '7) إضافات',
+                        '8) إضافات',
                         Column(
                           children: [
                             _switch('حركة كاميرا ناعمة', 'تحريك بطيء داخل كل مقطع', _pan, (v) => _pan = v),
@@ -1146,7 +1692,8 @@ class _ProjectPageState extends State<ProjectPage> {
                           ],
                         ),
                       ),
-                      _section('8) موسيقى (اختياري)', _buildMusic()),
+                      _section('9) كتابة على الفيديو', _buildTextControls()),
+                      _section('10) موسيقى (اختياري)', _buildMusic()),
                       const SizedBox(height: 70),
                     ],
                   ),
@@ -1174,6 +1721,64 @@ class _ProjectPageState extends State<ProjectPage> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildTextControls() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _switch('إضافة كتابة', 'نص يظهر فوق الفيديو (يدعم العربي)', _textOn, (v) => _textOn = v),
+        if (_textOn) ...[
+          TextField(
+            controller: _textCtrl,
+            minLines: 1,
+            maxLines: 3,
+            decoration: InputDecoration(
+              hintText: 'اكتب النص هنا…',
+              filled: true,
+              fillColor: kSurface,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+          _sub('مكان الكتابة'),
+          _chips<String>(_textPosNames.keys.toList(), _textPos, (v) => _textPosNames[v]!, (v) => _textPos = v),
+          _sub('الحجم'),
+          _chips<String>(_textSizeNames.keys.toList(), _textSize, (v) => _textSizeNames[v]!, (v) => _textSize = v),
+          _sub('اللون'),
+          Wrap(
+            spacing: 10,
+            children: _textColors.entries
+                .map((e) => GestureDetector(
+                      onTap: () => setState(() => _textColor = e.key),
+                      child: Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: e.value,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _textColor == e.key ? kAccent2 : Colors.white24,
+                            width: _textColor == e.key ? 3 : 1,
+                          ),
+                        ),
+                      ),
+                    ))
+                .toList(),
+          ),
+          _sub('وقت الظهور'),
+          _chips<int>(
+            [0, 1, 2],
+            _textTiming,
+            (v) => const ['طوال الفيديو', 'أول 5 ثواني', 'آخر 5 ثواني'][v],
+            (v) => _textTiming = v,
+          ),
+          _switch('خلفية خلف الكتابة', 'مربع شفاف غامق يوضّح النص', _textBox, (v) => _textBox = v),
+        ],
+      ],
     );
   }
 
@@ -1208,6 +1813,24 @@ class _ProjectPageState extends State<ProjectPage> {
               ],
             ),
           ],
+          if (!_busy && _errorDetail.isNotEmpty)
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                title: const Text(
+                  'تفاصيل تقنية (ابعتها لو الخطأ اتكرر)',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+                children: [
+                  SelectableText(
+                    _errorDetail,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontSize: 10, color: Colors.white54),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
