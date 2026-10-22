@@ -103,6 +103,7 @@ class SourceVideo {
   bool hasAudio;
   bool noAudio = false; // اتأكدنا فعلاً إن الصوت مش بيشتغل مع الفيديو ده
   bool analyzed = false;
+  bool muted = false; // كتم صوت المقطع (في وضع تقسيم الشاشة)
   List<double> scores = []; // درجة اهتمام كل ثانية (0..1)
   List<double> cuts = []; // أوقات تغيّر المشهد
 
@@ -380,6 +381,11 @@ class _HomePageState extends State<HomePage> {
     _load();
   }
 
+  Future<void> _newSplit() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => const SplitPage()));
+    _load();
+  }
+
   Future<void> _open(File f) async {
     await Navigator.push<String>(
       context,
@@ -431,6 +437,34 @@ class _HomePageState extends State<HomePage> {
                     Text(
                       'اختار فيديوهات والسحر يبدأ',
                       style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: _newSplit,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 22),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  color: kSurface,
+                  border: Border.all(color: kAccent2, width: 1.5),
+                ),
+                child: const Column(
+                  children: [
+                    Icon(Icons.view_column, size: 38, color: kAccent2),
+                    SizedBox(height: 6),
+                    Text(
+                      'تقسيم الشاشة',
+                      style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(height: 4),
+                    Text(
+                      'اختار 2 أو 3 مقاطع وتتشغل جنب بعض في شاشة واحدة',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
                     ),
                   ],
                 ),
@@ -1900,6 +1934,702 @@ class _ProjectPageState extends State<ProjectPage> {
             }),
           ),
       ],
+    );
+  }
+}
+
+// ───────────────────── Split Screen (تقسيم الشاشة) ─────────────────────
+
+Future<SourceVideo?> probeVideoFile(String path, String name) async {
+  double duration = 0;
+  bool hasAudio = true;
+  try {
+    final session = await FFprobeKit.getMediaInformation(path);
+    final info = session.getMediaInformation();
+    if (info != null) {
+      duration = double.tryParse(info.getDuration() ?? '') ?? 0;
+      final streams = info.getStreams();
+      hasAudio = streams.isEmpty ? true : streams.any(isAudioStream);
+    }
+  } catch (_) {}
+  if (duration <= 0) {
+    try {
+      final c = VideoPlayerController.file(File(path));
+      await c.initialize();
+      duration = c.value.duration.inMilliseconds / 1000;
+      await c.dispose();
+    } catch (_) {}
+  }
+  if (duration <= 0) return null;
+  return SourceVideo(path: path, name: name, duration: duration, hasAudio: hasAudio);
+}
+
+class SplitPage extends StatefulWidget {
+  const SplitPage({super.key});
+
+  @override
+  State<SplitPage> createState() => _SplitPageState();
+}
+
+class _SplitPageState extends State<SplitPage> {
+  final _picker = ImagePicker();
+  final List<SourceVideo> _clips = [];
+
+  String _layout = 'h2';
+  String _aspect = '16:9';
+  bool _hd = false;
+  bool _cover = true; // true = قص لملء المساحة / false = عرض كامل بخلفية سوداء
+
+  bool _busy = false;
+  bool _picking = false;
+  bool _cancelled = false;
+  double _progress = 0;
+  String _status = '';
+  String _errorDetail = '';
+  String _lastLog = '';
+  String? _enc;
+
+  static const _aspects = {
+    '9:16': 'ريلز 9:16',
+    '16:9': 'يوتيوب 16:9',
+    '1:1': 'مربع 1:1',
+  };
+
+  static const _layoutNames = {
+    'h2': 'جنب بعض',
+    'v2': 'فوق وتحت',
+    'h3': '3 جنب بعض',
+    'v3': '3 فوق بعض',
+    'bigTop': 'واحد كبير فوق واتنين تحت',
+    'bigLeft': 'واحد كبير يسار واتنين يمين',
+  };
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  void _set(String stage, double p) {
+    if (!mounted) return;
+    setState(() {
+      _status = stage;
+      _progress = p.clamp(0.0, 1.0).toDouble();
+    });
+  }
+
+  void _setP(double p) {
+    if (!mounted) return;
+    setState(() => _progress = p.clamp(0.0, 1.0).toDouble());
+  }
+
+  // ───── التقسيمات ─────
+
+  int get _count => max(2, _clips.length);
+
+  List<String> _layoutOptions() => _count >= 3 ? ['h3', 'v3', 'bigTop', 'bigLeft'] : ['h2', 'v2'];
+
+  String _effLayout() {
+    final o = _layoutOptions();
+    return o.contains(_layout) ? _layout : o.first;
+  }
+
+  (int, int) _outputSize() {
+    switch (_aspect) {
+      case '16:9':
+        return _hd ? (1920, 1080) : (1280, 720);
+      case '1:1':
+        return _hd ? (1080, 1080) : (720, 720);
+      default:
+        return _hd ? (1080, 1920) : (720, 1280);
+    }
+  }
+
+  /// كل مستطيل = [x, y, عرض, ارتفاع]
+  List<List<int>> _rects(String layout, int w, int h) {
+    int ev(num v) => (v / 2).floor() * 2;
+    switch (layout) {
+      case 'v2':
+        {
+          final a = ev(h / 2);
+          return [
+            [0, 0, w, a],
+            [0, a, w, h - a],
+          ];
+        }
+      case 'h3':
+        {
+          final a = ev(w / 3);
+          return [
+            [0, 0, a, h],
+            [a, 0, a, h],
+            [2 * a, 0, w - 2 * a, h],
+          ];
+        }
+      case 'v3':
+        {
+          final a = ev(h / 3);
+          return [
+            [0, 0, w, a],
+            [0, a, w, a],
+            [0, 2 * a, w, h - 2 * a],
+          ];
+        }
+      case 'bigTop':
+        {
+          final a = ev(h / 2);
+          final w1 = ev(w / 2);
+          return [
+            [0, 0, w, a],
+            [0, a, w1, h - a],
+            [w1, a, w - w1, h - a],
+          ];
+        }
+      case 'bigLeft':
+        {
+          final w1 = ev(w / 2);
+          final h1 = ev(h / 2);
+          return [
+            [0, 0, w1, h],
+            [w1, 0, w - w1, h1],
+            [w1, h1, w - w1, h - h1],
+          ];
+        }
+      default: // h2
+        {
+          final a = ev(w / 2);
+          return [
+            [0, 0, a, h],
+            [a, 0, w - a, h],
+          ];
+        }
+    }
+  }
+
+  // ───── اختيار المقاطع ─────
+
+  Future<void> _addVideo() async {
+    if (_clips.length >= 3) {
+      _toast('الحد الأقصى 3 مقاطع');
+      return;
+    }
+    final x = await _picker.pickVideo(source: ImageSource.gallery);
+    if (x == null) return;
+    setState(() => _picking = true);
+    final v = await probeVideoFile(x.path, x.name);
+    if (!mounted) return;
+    setState(() {
+      _picking = false;
+      if (v != null) {
+        _clips.add(v);
+      }
+    });
+    if (v == null) _toast('تعذر قراءة الفيديو ده');
+  }
+
+  void _moveUp(int i) {
+    if (i <= 0) return;
+    setState(() {
+      final c = _clips.removeAt(i);
+      _clips.insert(i - 1, c);
+    });
+  }
+
+  // ───── FFmpeg ─────
+
+  Future<bool> _exec(String cmd, {void Function(int ms)? onTime}) async {
+    final c = Completer<bool>();
+    var tail = '';
+    await FFmpegKit.executeAsync(
+      cmd,
+      (session) async {
+        final code = await session.getReturnCode();
+        final ok = ReturnCode.isSuccess(code);
+        if (!ok) _lastLog = tail;
+        c.complete(ok);
+      },
+      (log) {
+        tail += '${log.getMessage()}\n';
+        if (tail.length > 6000) tail = tail.substring(tail.length - 3000);
+      },
+      onTime == null ? null : (s) => onTime(s.getTime().toInt()),
+    );
+    return c.future;
+  }
+
+  Future<void> _detectEncoder() async {
+    if (_enc != null) return;
+    const candidates = [
+      '-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p',
+      '-c:v h264_mediacodec -b:v 10M -pix_fmt yuv420p',
+      '-c:v mpeg4 -q:v 3 -pix_fmt yuv420p',
+    ];
+    for (final c in candidates) {
+      final ok = await _exec('-y -f lavfi -i color=c=black:s=640x360:r=30:d=0.4 $c -f null -');
+      if (ok) {
+        _enc = c;
+        return;
+      }
+    }
+    _enc = candidates.last;
+  }
+
+  String _cell(int i, int w, int h) {
+    if (_cover) {
+      return '[$i:v]fps=30,scale=$w:$h:force_original_aspect_ratio=increase,crop=$w:$h,setsar=1[c$i]';
+    }
+    return '[$i:v]fps=30,scale=$w:$h:force_original_aspect_ratio=decrease,'
+        'pad=$w:$h:(ow-iw)/2:(oh-ih)/2:black,setsar=1[c$i]';
+  }
+
+  bool _plannedAudio() => _clips.any((c) => c.hasAudio && !c.muted);
+
+  String _buildCmd(List<List<int>> rects, int w, int h, double total, String out, bool withAudio) {
+    final n = _clips.length;
+    final totalStr = total.toStringAsFixed(3);
+
+    final inputs = StringBuffer();
+    for (final c in _clips) {
+      // تكرار المقاطع الأقصر لحد ما الأطول يخلص
+      inputs.write('-stream_loop -1 -i "${c.path}" ');
+    }
+
+    final fc = <String>['color=c=black:s=${w}x$h:r=30[bg]'];
+    for (var i = 0; i < n; i++) {
+      fc.add(_cell(i, rects[i][2], rects[i][3]));
+    }
+    var prev = '[bg]';
+    for (var i = 0; i < n; i++) {
+      fc.add('$prev[c$i]overlay=${rects[i][0]}:${rects[i][1]}[t$i]');
+      prev = '[t$i]';
+    }
+    fc.add('${prev}format=yuv420p[vout]');
+
+    // الصوت: دمج كل الأصوات غير المكتومة
+    final audIdx = <int>[];
+    if (withAudio) {
+      for (var i = 0; i < n; i++) {
+        if (_clips[i].hasAudio && !_clips[i].muted) audIdx.add(i);
+      }
+    }
+    if (audIdx.isNotEmpty) {
+      for (final i in audIdx) {
+        fc.add('[$i:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a$i]');
+      }
+      if (audIdx.length == 1) {
+        fc.add('[a${audIdx.first}]anull[aout]');
+      } else {
+        final ins = audIdx.map((i) => '[a$i]').join();
+        final k = audIdx.length;
+        fc.add('${ins}amix=inputs=$k:duration=first:dropout_transition=0,'
+            'volume=${(k * 0.75).toStringAsFixed(2)}[aout]');
+      }
+    }
+
+    final audioArgs = audIdx.isNotEmpty ? '-map "[aout]" -c:a aac -b:a 192k -ar 44100 -ac 2' : '-an';
+    return '-y ${inputs.toString()}-filter_complex "${fc.join(';')}" -map "[vout]" $audioArgs '
+        '-t $totalStr $_enc -movflags +faststart "$out"';
+  }
+
+  // ───── التشغيل ─────
+
+  Future<void> _generate() async {
+    if (_clips.length < 2) {
+      _toast('اختار مقطعين على الأقل');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _cancelled = false;
+      _progress = 0;
+      _status = 'جاري التجهيز…';
+      _errorDetail = '';
+    });
+
+    await FlutterForegroundTask.startService(
+      notificationTitle: 'جاري تقسيم الشاشة',
+      notificationText: 'المعالجة مستمرة في الخلفية...',
+    );
+
+    String? resultPath;
+    String? partialPath;
+    try {
+      await _detectEncoder();
+      final (w, h) = _outputSize();
+      final rects = _rects(_effLayout(), w, h);
+      final total = _clips.map((c) => c.duration).reduce(max);
+
+      final dir = await montagesDir();
+      final path = '${dir.path}/split_${DateTime.now().millisecondsSinceEpoch}.mp4';
+      partialPath = path;
+
+      _set('جاري دمج المقاطع في شاشة واحدة…', 0);
+      void prog(int ms) => _setP(ms / (max(0.5, total) * 1000));
+
+      final planned = _plannedAudio();
+      var ok = await _exec(_buildCmd(rects, w, h, total, path, true), onTime: prog);
+      var dropped = false;
+      if (!ok && !_cancelled && planned) {
+        ok = await _exec(_buildCmd(rects, w, h, total, path, false), onTime: prog);
+        dropped = ok;
+      }
+      if (_cancelled) throw 'cancel';
+      if (!ok) throw 'فشل التصدير';
+
+      resultPath = path;
+      final msg = dropped
+          ? 'تم! الفيديو جاهز 🎉\n⚠️ تعذر دمج الصوت، فالفيديو طلع صامت.'
+          : 'تم! الفيديو جاهز 🎉';
+      _set(msg, 1);
+    } catch (e) {
+      if (e != 'cancel' && mounted) setState(() => _errorDetail = _lastLog);
+      _set(e == 'cancel' ? 'تم الإلغاء' : 'حدث خطأ: $e', 0);
+    } finally {
+      await FlutterForegroundTask.stopService();
+      if (resultPath == null && partialPath != null) {
+        try {
+          final f = File(partialPath);
+          if (f.existsSync()) f.deleteSync();
+        } catch (_) {}
+      }
+      if (mounted) setState(() => _busy = false);
+    }
+
+    final done = resultPath;
+    if (done != null && mounted) {
+      await Navigator.push<String>(
+        context,
+        MaterialPageRoute(builder: (_) => PlayerPage(file: File(done), fromProject: false)),
+      );
+    }
+  }
+
+  void _cancel() {
+    _cancelled = true;
+    FFmpegKit.cancel();
+  }
+
+  // ───── الواجهة ─────
+
+  Widget _section(String title, Widget child) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: kAccent)),
+          const SizedBox(height: 8),
+          child,
+        ],
+      ),
+    );
+  }
+
+  Widget _chips<T>(List<T> values, T current, String Function(T) label, void Function(T) onSel) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 4,
+      children: values
+          .map((v) => ChoiceChip(
+                label: Text(label(v)),
+                selected: v == current,
+                selectedColor: kAccent,
+                onSelected: (_) => setState(() => onSel(v)),
+              ))
+          .toList(),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canStart = !_busy && !_picking && _clips.length >= 2;
+    return PopScope(
+      canPop: !_busy,
+      child: Scaffold(
+        appBar: AppBar(title: const Text('تقسيم الشاشة'), backgroundColor: kBg),
+        body: Column(
+          children: [
+            if (_busy || _status.isNotEmpty) _buildStatusCard(),
+            Expanded(
+              child: IgnorePointer(
+                ignoring: _busy,
+                child: Opacity(
+                  opacity: _busy ? 0.4 : 1,
+                  child: ListView(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                    children: [
+                      _section('1) المقاطع (2 أو 3)', _buildClips()),
+                      _section(
+                        '2) شكل التقسيم',
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _chips<String>(
+                              _layoutOptions(),
+                              _effLayout(),
+                              (v) => _layoutNames[v]!,
+                              (v) => _layout = v,
+                            ),
+                            const SizedBox(height: 12),
+                            _buildPreview(),
+                            const SizedBox(height: 6),
+                            const Text(
+                              'المقطع رقم 1 بيبقى في الأعلى أو على الشمال، وتقدر تغيّر الترتيب بالسهم.',
+                              style: TextStyle(fontSize: 11, color: Colors.white38),
+                            ),
+                          ],
+                        ),
+                      ),
+                      _section(
+                        '3) الشكل والجودة',
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _chips<String>(_aspects.keys.toList(), _aspect, (v) => _aspects[v]!, (v) => _aspect = v),
+                            const SizedBox(height: 8),
+                            _chips<bool>([false, true], _hd, (v) => v ? 'عالية 1080p' : 'سريعة 720p', (v) => _hd = v),
+                            const SizedBox(height: 8),
+                            _chips<bool>(
+                              [true, false],
+                              _cover,
+                              (v) => v ? 'قص لملء المساحة' : 'عرض كامل (بحواف سوداء)',
+                              (v) => _cover = v,
+                            ),
+                          ],
+                        ),
+                      ),
+                      _buildInfo(),
+                      const SizedBox(height: 70),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: kAccent,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              onPressed: canStart ? _generate : null,
+              icon: const Icon(Icons.view_column, color: Colors.white),
+              label: const Text(
+                'ابدأ التقسيم ✨',
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfo() {
+    if (_clips.length < 2) return const SizedBox.shrink();
+    final total = _clips.map((c) => c.duration).reduce(max);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(12)),
+      child: Text(
+        'مدة الفيديو النهائي: ${fmtDur(total)} (أطول مقطع). المقاطع الأقصر هتتكرر لحد ما الأطول يخلص.\n'
+        'الأصوات كلها بتتدمج، وتقدر تكتم أي مقطع من زرار السماعة.',
+        style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
+      ),
+    );
+  }
+
+  Widget _buildPreview() {
+    final (w, h) = _outputSize();
+    final rects = _rects(_effLayout(), w, h);
+    return Center(
+      child: SizedBox(
+        height: 150,
+        child: AspectRatio(
+          aspectRatio: w / h,
+          child: LayoutBuilder(
+            builder: (context, cons) {
+              final sx = cons.maxWidth / w;
+              final sy = cons.maxHeight / h;
+              return Stack(
+                children: [
+                  for (var i = 0; i < rects.length; i++)
+                    Positioned(
+                      left: rects[i][0] * sx + 1,
+                      top: rects[i][1] * sy + 1,
+                      width: max(2.0, rects[i][2] * sx - 2),
+                      height: max(2.0, rects[i][3] * sy - 2),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: kSurface,
+                          border: Border.all(color: kAccent),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Center(
+                          child: Text(
+                            '${i + 1}',
+                            style: const TextStyle(fontWeight: FontWeight.bold, color: kAccent2),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildClips() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (_clips.length < 3)
+          OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              side: const BorderSide(color: kAccent),
+            ),
+            onPressed: _picking ? null : _addVideo,
+            icon: _picking
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+                  )
+                : const Icon(Icons.video_library, color: kAccent),
+            label: Text(_clips.isEmpty ? 'اختيار أول مقطع' : 'إضافة مقطع (${_clips.length}/3)'),
+          ),
+        for (var i = 0; i < _clips.length; i++) _clipCard(i),
+        if (_clips.length < 2)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'اختار مقطعين على الأقل (والحد الأقصى 3).',
+              style: TextStyle(fontSize: 11, color: kAccent2),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _clipCard(int i) {
+    final c = _clips[i];
+    return Card(
+      color: kSurface,
+      margin: const EdgeInsets.only(top: 8),
+      child: ListTile(
+        dense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10),
+        leading: CircleAvatar(
+          radius: 14,
+          backgroundColor: kAccent,
+          child: Text('${i + 1}', style: const TextStyle(fontSize: 13, color: Colors.white)),
+        ),
+        title: Text(
+          c.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 13),
+        ),
+        subtitle: Text(
+          c.hasAudio ? fmtDur(c.duration) : '${fmtDur(c.duration)}  •  بدون صوت',
+          style: const TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (c.hasAudio)
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: c.muted ? 'تشغيل الصوت' : 'كتم الصوت',
+                icon: Icon(
+                  c.muted ? Icons.volume_off : Icons.volume_up,
+                  size: 22,
+                  color: c.muted ? Colors.redAccent : kAccent2,
+                ),
+                onPressed: () => setState(() => c.muted = !c.muted),
+              )
+            else
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8),
+                child: Icon(Icons.volume_off, size: 22, color: Colors.white24),
+              ),
+            if (i > 0)
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'تقديم',
+                icon: const Icon(Icons.arrow_upward, size: 20, color: Colors.white54),
+                onPressed: () => _moveUp(i),
+              ),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: 'حذف',
+              icon: const Icon(Icons.close, size: 20, color: Colors.white54),
+              onPressed: () => setState(() => _clips.removeAt(i)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(_status, style: const TextStyle(fontSize: 13)),
+          if (_busy) ...[
+            const SizedBox(height: 10),
+            LinearProgressIndicator(
+              value: _progress > 0 ? _progress : null,
+              color: kAccent,
+              backgroundColor: Colors.white12,
+              minHeight: 6,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Text('${(_progress * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                const Spacer(),
+                TextButton(
+                  onPressed: _cancel,
+                  child: const Text('إلغاء', style: TextStyle(color: Colors.redAccent)),
+                ),
+              ],
+            ),
+          ],
+          if (!_busy && _errorDetail.isNotEmpty)
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                title: const Text(
+                  'تفاصيل تقنية (ابعتها لو الخطأ اتكرر)',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+                children: [
+                  SelectableText(
+                    _errorDetail,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontSize: 10, color: Colors.white54),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
