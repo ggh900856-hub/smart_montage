@@ -3093,4 +3093,409 @@ class _SplitPageState extends State<SplitPage> {
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
             child: ElevatedButton.icon(
-              style: ElevatedButton.styleFr
+                            style: ElevatedButton.styleFrom(
+                backgroundColor: kAccent,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              onPressed: canStart ? _generate : null,
+              icon: const Icon(Icons.view_column, color: Colors.white),
+              label: const Text(
+                'ابدأ التقسيم ✨',
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(_status, style: const TextStyle(fontSize: 13)),
+          if (_busy) ...[
+            const SizedBox(height: 10),
+            LinearProgressIndicator(
+              value: _progress > 0 ? _progress : null,
+              color: kAccent,
+              backgroundColor: Colors.white12,
+              minHeight: 6,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Text('${(_progress * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                const Spacer(),
+                TextButton(
+                  onPressed: _cancel,
+                  child: const Text('إلغاء', style: TextStyle(color: Colors.redAccent)),
+                ),
+              ],
+            ),
+          ],
+          if (!_busy && _errorDetail.isNotEmpty)
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                title: const Text(
+                  'تفاصيل تقنية (ابعتها لو الخطأ اتكرر)',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+                children: [
+                  SelectableText(
+                    _errorDetail,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontSize: 10, color: Colors.white54),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildClips() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            side: const BorderSide(color: kAccent),
+          ),
+          onPressed: (_picking || _clips.length >= 3) ? null : _addVideo,
+          icon: _picking
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+                )
+              : const Icon(Icons.video_library, color: kAccent),
+          label: Text(_clips.isEmpty ? 'اختيار مقطع' : 'إضافة مقطع (${_clips.length}/3)'),
+        ),
+        for (var i = 0; i < _clips.length; i++)
+          Card(
+            color: kSurface,
+            margin: const EdgeInsets.only(top: 8),
+            child: ListTile(
+              dense: true,
+              leading: CircleAvatar(
+                radius: 14,
+                backgroundColor: kAccent,
+                child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 12)),
+              ),
+              title: Text(
+                _clips[i].name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 13),
+              ),
+              subtitle: Text(
+                fmtDur(_clips[i].duration),
+                style: const TextStyle(fontSize: 11, color: Colors.grey),
+              ),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_clips[i].hasAudio)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(
+                        _clips[i].muted ? Icons.volume_off : Icons.volume_up,
+                        size: 20,
+                        color: _clips[i].muted ? Colors.redAccent : Colors.white54,
+                      ),
+                      onPressed: () => setState(() => _clips[i].muted = !_clips[i].muted),
+                    ),
+                  if (i > 0)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.arrow_upward, size: 20, color: Colors.white54),
+                      onPressed: () => _moveUp(i),
+                    ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.close, size: 20, color: Colors.white54),
+                    onPressed: () => setState(() => _clips.removeAt(i)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPreview() {
+    final (w, h) = _outputSize();
+    final rects = _rects(_effLayout(), w, h);
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 220),
+        child: AspectRatio(
+          aspectRatio: w / h,
+          child: LayoutBuilder(
+            builder: (context, c) {
+              final sx = c.maxWidth / w;
+              final sy = c.maxHeight / h;
+              return Container(
+                decoration: BoxDecoration(border: Border.all(color: Colors.white24)),
+                child: Stack(
+                  children: [
+                    for (var i = 0; i < rects.length; i++)
+                      Positioned(
+                        left: rects[i][0] * sx,
+                        top: rects[i][1] * sy,
+                        width: rects[i][2] * sx,
+                        height: rects[i][3] * sy,
+                        child: Container(
+                          margin: const EdgeInsets.all(1),
+                          alignment: Alignment.center,
+                          color: i < _clips.length ? kAccent.withOpacity(0.35) : Colors.white10,
+                          child: Text(
+                            '${i + 1}',
+                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfo() {
+    return const Padding(
+      padding: EdgeInsets.only(bottom: 8),
+      child: Text(
+        'مدة الفيديو النهائي = مدة أطول مقطع، والمقاطع الأقصر بتتكرر لحد ما الأطول يخلص. '
+        'الأصوات غير المكتومة بتتدمج مع بعض.',
+        style: TextStyle(fontSize: 11, color: Colors.white38, height: 1.5),
+      ),
+    );
+  }
+}
+
+// ───────────────────────── Player ─────────────────────────
+
+class PlayerPage extends StatefulWidget {
+  final File file;
+  final bool fromProject;
+
+  const PlayerPage({super.key, required this.file, required this.fromProject});
+
+  @override
+  State<PlayerPage> createState() => _PlayerPageState();
+}
+
+class _PlayerPageState extends State<PlayerPage> {
+  VideoPlayerController? _c;
+  bool _ready = false;
+  bool _failed = false;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    try {
+      final c = VideoPlayerController.file(widget.file);
+      await c.initialize();
+      await c.setLooping(true);
+      await c.play();
+      if (!mounted) {
+        await c.dispose();
+        return;
+      }
+      setState(() {
+        _c = c;
+        _ready = true;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _c?.dispose();
+    super.dispose();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _save() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    try {
+      await Gal.putVideo(widget.file.path, album: 'المونتاج الذكي');
+      _toast('اتحفظ في المعرض ✅');
+    } catch (_) {
+      _toast('تعذر الحفظ في المعرض');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _share() async {
+    try {
+      await Share.shareXFiles([XFile(widget.file.path)]);
+    } catch (_) {
+      _toast('تعذرت المشاركة');
+    }
+  }
+
+  Future<void> _delete() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kSurface,
+        title: const Text('حذف المونتاج؟', style: TextStyle(fontSize: 16)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('إلغاء', style: TextStyle(color: Colors.grey)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('حذف', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await _c?.pause();
+    ThumbService.forget(widget.file);
+    try {
+      await widget.file.delete();
+    } catch (_) {}
+    if (mounted) Navigator.pop(context);
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes.toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  Widget _actionBtn(IconData icon, String label, Color color, VoidCallback? onTap) {
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          child: Column(
+            children: [
+              Icon(icon, color: onTap == null ? Colors.white24 : color),
+              const SizedBox(height: 4),
+              Text(label, style: const TextStyle(fontSize: 12)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _c;
+    return Scaffold(
+      appBar: AppBar(title: const Text('المعاينة'), backgroundColor: kBg),
+      body: Column(
+        children: [
+          Expanded(
+            child: Center(
+              child: _failed
+                  ? const Text('تعذر تشغيل الفيديو', style: TextStyle(color: Colors.grey))
+                  : (!_ready || c == null)
+                      ? const CircularProgressIndicator(color: kAccent)
+                      : GestureDetector(
+                          onTap: () => setState(() {
+                            c.value.isPlaying ? c.pause() : c.play();
+                          }),
+                          child: AspectRatio(
+                            aspectRatio: c.value.aspectRatio,
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                VideoPlayer(c),
+                                if (!c.value.isPlaying)
+                                  const Icon(Icons.play_circle_fill, size: 64, color: Colors.white70),
+                              ],
+                            ),
+                          ),
+                        ),
+            ),
+          ),
+          if (_ready && c != null)
+            ValueListenableBuilder<VideoPlayerValue>(
+              valueListenable: c,
+              builder: (context, v, _) {
+                final total = v.duration.inMilliseconds.toDouble();
+                final pos = v.position.inMilliseconds.toDouble().clamp(0.0, max(1.0, total)).toDouble();
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Row(
+                    children: [
+                      Text(_fmt(v.position), style: const TextStyle(fontSize: 12, color: Colors.white54)),
+                      Expanded(
+                        child: Directionality(
+                          textDirection: TextDirection.ltr,
+                          child: Slider(
+                            min: 0,
+                            max: max(1.0, total),
+                            value: pos,
+                            activeColor: kAccent,
+                            onChanged: (x) => c.seekTo(Duration(milliseconds: x.round())),
+                          ),
+                        ),
+                      ),
+                      Text(_fmt(v.duration), style: const TextStyle(fontSize: 12, color: Colors.white54)),
+                    ],
+                  ),
+                );
+              },
+            ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+              child: Row(
+                children: [
+                  _actionBtn(Icons.download, 'حفظ', kAccent, _saving ? null : _save),
+                  _actionBtn(Icons.share, 'مشاركة', kAccent2, _share),
+                  if (widget.fromProject)
+                    _actionBtn(Icons.shuffle, 'مونتاج تاني', Colors.white70, () {
+                      Navigator.pop(context, 'remix');
+                    }),
+                  _actionBtn(Icons.delete_outline, 'حذف', Colors.redAccent, _delete),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
