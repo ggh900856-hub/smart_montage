@@ -80,6 +80,17 @@ String formatSize(int bytes) {
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
 }
 
+double aspectOf(String a) {
+  switch (a) {
+    case '16:9':
+      return 16 / 9;
+    case '1:1':
+      return 1.0;
+    default:
+      return 9 / 16;
+  }
+}
+
 /// فحص مرن لنوع الستريم (بيتعامل مع اختلاف إصدارات الباكيدج)
 bool isAudioStream(dynamic s) {
   try {
@@ -315,6 +326,780 @@ class VideoThumb extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+// ───────────────────── الطبقات: صور PiP + كتابة حرة ─────────────────────
+
+/// عنصر فوق الفيديو (صورة أو كتابة). الإحداثيات نسب من 0 لـ 1 من حجم الفيديو
+/// فبتتطبق بنفس المكان بالظبط على أي جودة أو أبعاد.
+class OverlayItem {
+  final bool isImage;
+  ui.Image? image;
+  String text;
+  Color color;
+  bool box; // خلفية غامقة خلف الكتابة
+  double cx; // مركز العنصر (أفقي)
+  double cy; // مركز العنصر (رأسي)
+  double scale;
+  double rotation; // بالراديان
+  double opacity;
+  int timing; // 0 طوال الفيديو / 1 أول 5 ثواني / 2 آخر 5 ثواني
+  int shape; // للصور: 0 حواف مدورة / 1 دائرة / 2 مربع
+  bool border;
+
+  OverlayItem({
+    required this.isImage,
+    this.image,
+    this.text = '',
+    this.color = Colors.white,
+    this.box = true,
+    this.cx = 0.5,
+    this.cy = 0.5,
+    this.scale = 1.0,
+    this.rotation = 0.0,
+    this.opacity = 1.0,
+    this.timing = 0,
+    this.shape = 0,
+    this.border = false,
+  });
+
+  bool get valid => isImage ? image != null : text.trim().isNotEmpty;
+}
+
+Future<ui.Image?> loadUiImage(String path) async {
+  try {
+    final bytes = await File(path).readAsBytes();
+    var codec = await ui.instantiateImageCodec(bytes);
+    var frame = await codec.getNextFrame();
+    var img = frame.image;
+    if (img.width > 1280 || img.height > 1280) {
+      final wide = img.width >= img.height;
+      img.dispose();
+      codec.dispose();
+      codec = await ui.instantiateImageCodec(
+        bytes,
+        targetWidth: wide ? 1280 : null,
+        targetHeight: wide ? null : 1280,
+      );
+      frame = await codec.getNextFrame();
+      img = frame.image;
+    }
+    return img;
+  } catch (_) {
+    return null;
+  }
+}
+
+TextPainter overlayTextPainter(OverlayItem it, Size frame) {
+  final minSide = min(frame.width, frame.height);
+  final fs = minSide * 0.065 * it.scale;
+  final isRtl = RegExp(r'[\u0600-\u06FF]').hasMatch(it.text);
+  final shadowColor = it.color.computeLuminance() < 0.2 ? Colors.white : Colors.black;
+  return TextPainter(
+    text: TextSpan(
+      text: it.text,
+      style: TextStyle(
+        color: it.color,
+        fontSize: fs,
+        fontWeight: FontWeight.w800,
+        height: 1.3,
+        shadows: [Shadow(color: shadowColor, blurRadius: fs * 0.12, offset: Offset(0, fs * 0.04))],
+      ),
+    ),
+    textAlign: TextAlign.center,
+    textDirection: isRtl ? TextDirection.rtl : TextDirection.ltr,
+    textWidthBasis: TextWidthBasis.longestLine,
+  )..layout(maxWidth: frame.width * 0.9);
+}
+
+Size overlayItemSize(OverlayItem it, Size frame) {
+  final minSide = min(frame.width, frame.height);
+  if (it.isImage) {
+    final img = it.image;
+    if (img == null) return Size.zero;
+    final w = minSide * 0.35 * it.scale;
+    final h = it.shape == 1 ? w : w * img.height / img.width;
+    return Size(w, h);
+  }
+  final tp = overlayTextPainter(it, frame);
+  final pad = minSide * 0.065 * it.scale * 0.5;
+  return Size(tp.width + pad * 2, tp.height + pad * 1.2);
+}
+
+/// نفس دالة الرسم بتتستخدم في المعاينة وفي التصدير (علشان الشكل يطلع زي ما شايفه)
+void paintOverlayItem(Canvas canvas, Size frame, OverlayItem it) {
+  if (!it.valid) return;
+  final minSide = min(frame.width, frame.height);
+  canvas.save();
+  canvas.translate(it.cx * frame.width, it.cy * frame.height);
+  canvas.rotate(it.rotation);
+  final fade = it.opacity < 0.999;
+  if (fade) {
+    canvas.saveLayer(null, Paint()..color = Color.fromRGBO(255, 255, 255, it.opacity));
+  }
+
+  if (it.isImage) {
+    final img = it.image!;
+    final sz = overlayItemSize(it, frame);
+    final dst = Rect.fromCenter(center: Offset.zero, width: sz.width, height: sz.height);
+    Rect src;
+    if (it.shape == 1) {
+      final s = min(img.width, img.height).toDouble();
+      src = Rect.fromCenter(center: Offset(img.width / 2, img.height / 2), width: s, height: s);
+    } else {
+      src = Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble());
+    }
+    final radius = it.shape == 1 ? sz.width / 2 : (it.shape == 2 ? 0.0 : minSide * 0.02);
+    final rr = RRect.fromRectAndRadius(dst, Radius.circular(radius));
+    canvas.save();
+    canvas.clipRRect(rr, doAntiAlias: true);
+    canvas.drawImageRect(img, src, dst, Paint()..filterQuality = FilterQuality.high);
+    canvas.restore();
+    if (it.border) {
+      canvas.drawRRect(
+        rr,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = max(2.0, minSide * 0.006)
+          ..color = Colors.white,
+      );
+    }
+  } else {
+    final tp = overlayTextPainter(it, frame);
+    final fs = minSide * 0.065 * it.scale;
+    final pad = fs * 0.5;
+    if (it.box) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(
+            center: Offset.zero,
+            width: tp.width + pad * 2,
+            height: tp.height + pad * 1.2,
+          ),
+          Radius.circular(pad),
+        ),
+        Paint()..color = const Color.fromARGB(140, 0, 0, 0),
+      );
+    }
+    tp.paint(canvas, Offset(-tp.width / 2, -tp.height / 2));
+  }
+
+  if (fade) canvas.restore();
+  canvas.restore();
+}
+
+class OverlayLayer {
+  final String png;
+  final int timing;
+  const OverlayLayer(this.png, this.timing);
+}
+
+/// بيرسم كل العناصر في صور شفافة بحجم الفيديو (صورة لكل وقت ظهور)
+Future<List<OverlayLayer>> buildOverlayLayers(
+  List<OverlayItem> items,
+  int w,
+  int h,
+  String dir,
+) async {
+  final out = <OverlayLayer>[];
+  final size = Size(w.toDouble(), h.toDouble());
+  for (var t = 0; t < 3; t++) {
+    final group = items.where((i) => i.valid && i.timing == t).toList();
+    if (group.isEmpty) continue;
+    try {
+      final rec = ui.PictureRecorder();
+      final canvas = Canvas(rec, Offset.zero & size);
+      for (final it in group) {
+        paintOverlayItem(canvas, size, it);
+      }
+      final pic = rec.endRecording();
+      final img = await pic.toImage(w, h);
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      img.dispose();
+      if (bd == null) continue;
+      final path = '$dir/overlay_$t.png';
+      await File(path).writeAsBytes(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
+      out.add(OverlayLayer(path, t));
+    } catch (_) {}
+  }
+  return out;
+}
+
+/// فلاتر FFmpeg اللي بتركّب الطبقات فوق الفيديو
+({List<String> fc, String label}) overlayFilters(
+  List<OverlayLayer> layers,
+  int firstIdx,
+  String inLabel,
+  double total,
+) {
+  final fc = <String>[];
+  var cur = inLabel;
+  for (var i = 0; i < layers.length; i++) {
+    final idx = firstIdx + i;
+    var enable = '';
+    if (layers[i].timing == 1) {
+      enable = ":enable='lt(t,5)'";
+    } else if (layers[i].timing == 2) {
+      enable = ":enable='gt(t,${max(0.0, total - 5).toStringAsFixed(3)})'";
+    }
+    fc.add('[$idx:v]format=rgba[ov$i]');
+    fc.add('$cur[ov$i]overlay=0:0$enable[ot$i]');
+    cur = '[ot$i]';
+  }
+  return (fc: fc, label: cur);
+}
+
+class _OverlayPainter extends CustomPainter {
+  final List<OverlayItem> items;
+  final OverlayItem? selected;
+  _OverlayPainter(this.items, this.selected);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.clipRect(Offset.zero & size);
+    for (final it in items) {
+      paintOverlayItem(canvas, size, it);
+    }
+    final s = selected;
+    if (s != null && s.valid) {
+      final sz = overlayItemSize(s, size);
+      canvas.save();
+      canvas.translate(s.cx * size.width, s.cy * size.height);
+      canvas.rotate(s.rotation);
+      canvas.drawRect(
+        Rect.fromCenter(center: Offset.zero, width: sz.width + 8, height: sz.height + 8),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5
+          ..color = kAccent2,
+      );
+      canvas.restore();
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _OverlayPainter oldDelegate) => true;
+}
+
+/// كارت مختصر بيظهر في صفحة المونتاج وتقسيم الشاشة ويفتح المحرر
+class OverlaysCard extends StatelessWidget {
+  final List<OverlayItem> items;
+  final String aspect;
+  final String? backdropVideo;
+  final VoidCallback onChanged;
+
+  const OverlaysCard({
+    super.key,
+    required this.items,
+    required this.aspect,
+    required this.backdropVideo,
+    required this.onChanged,
+  });
+
+  Future<void> _open(BuildContext context) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OverlayEditorPage(
+          items: items,
+          aspect: aspectOf(aspect),
+          backdropVideo: backdropVideo,
+        ),
+      ),
+    );
+    onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final valid = items.where((e) => e.valid).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (valid.isEmpty)
+          const Text(
+            'تقدر تضيف صورة صغيرة (PiP) وكتابة حرة تحركها في أي مكان على الفيديو.',
+            style: TextStyle(fontSize: 11, color: Colors.white38),
+          )
+        else
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final it in valid)
+                Chip(
+                  backgroundColor: kSurface,
+                  avatar: Icon(it.isImage ? Icons.image : Icons.text_fields, size: 16, color: kAccent2),
+                  label: Text(
+                    it.isImage ? 'صورة' : (it.text.length > 14 ? '${it.text.substring(0, 14)}…' : it.text),
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+            ],
+          ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            side: const BorderSide(color: kAccent),
+          ),
+          onPressed: () => _open(context),
+          icon: const Icon(Icons.layers, color: kAccent),
+          label: Text(valid.isEmpty ? 'فتح محرر الصور والكتابة' : 'تعديل (${valid.length} عناصر)'),
+        ),
+      ],
+    );
+  }
+}
+
+/// محرر الطبقات: معاينة بنسبة الفيديو النهائي، اسحب وكبّر وكتابة حرة
+class OverlayEditorPage extends StatefulWidget {
+  final List<OverlayItem> items;
+  final double aspect;
+  final String? backdropVideo;
+
+  const OverlayEditorPage({
+    super.key,
+    required this.items,
+    required this.aspect,
+    this.backdropVideo,
+  });
+
+  @override
+  State<OverlayEditorPage> createState() => _OverlayEditorPageState();
+}
+
+class _OverlayEditorPageState extends State<OverlayEditorPage> {
+  static const int _maxItems = 8;
+  static const _timingNames = ['طوال الفيديو', 'أول 5 ثواني', 'آخر 5 ثواني'];
+  static const _shapeNames = ['حواف مدورة', 'دائرة', 'مربع'];
+  static const List<Color> _colors = [
+    Colors.white,
+    Color(0xFFFFE14D),
+    kAccent,
+    Color(0xFF6BFF8A),
+    Color(0xFF4DE1FF),
+    Color(0xFFFF8A3D),
+    Colors.black,
+  ];
+
+  final _picker = ImagePicker();
+  OverlayItem? _sel;
+  File? _backdrop;
+
+  OverlayItem? _active;
+  double _s0 = 1;
+  double _r0 = 0;
+  int _lastCount = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBackdrop();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _loadBackdrop() async {
+    final src = widget.backdropVideo;
+    if (src == null) return;
+    try {
+      final tmp = await getTemporaryDirectory();
+      final out = File('${tmp.path}/overlay_backdrop_${src.hashCode}.jpg');
+      if (!await out.exists() || await out.length() == 0) {
+        for (final ss in ['1', '0']) {
+          final s = await FFmpegKit.execute(
+            '-y -ss $ss -i "$src" -frames:v 1 -vf scale=720:-2 -q:v 4 "${out.path}"',
+          );
+          final code = await s.getReturnCode();
+          if (ReturnCode.isSuccess(code) && await out.exists() && await out.length() > 0) break;
+        }
+      }
+      if (await out.exists() && await out.length() > 0 && mounted) {
+        setState(() => _backdrop = out);
+      }
+    } catch (_) {}
+  }
+
+  Future<String?> _askText(String initial) async {
+    final ctrl = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kSurface,
+        title: const Text('الكتابة', style: TextStyle(fontSize: 16)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          minLines: 1,
+          maxLines: 4,
+          decoration: const InputDecoration(hintText: 'اكتب النص هنا…'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('إلغاء', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kAccent),
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('تم', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _addImage() async {
+    if (widget.items.length >= _maxItems) {
+      _toast('الحد الأقصى $_maxItems عناصر');
+      return;
+    }
+    final x = await _picker.pickImage(source: ImageSource.gallery);
+    if (x == null) return;
+    final img = await loadUiImage(x.path);
+    if (img == null) {
+      _toast('تعذر قراءة الصورة دي');
+      return;
+    }
+    if (!mounted) return;
+    final it = OverlayItem(isImage: true, image: img, cx: 0.78, cy: 0.18);
+    setState(() {
+      widget.items.add(it);
+      _sel = it;
+    });
+  }
+
+  Future<void> _addText() async {
+    if (widget.items.length >= _maxItems) {
+      _toast('الحد الأقصى $_maxItems عناصر');
+      return;
+    }
+    final t = await _askText('');
+    if (t == null || t.isEmpty || !mounted) return;
+    final it = OverlayItem(isImage: false, text: t, cy: 0.8);
+    setState(() {
+      widget.items.add(it);
+      _sel = it;
+    });
+  }
+
+  Future<void> _editText(OverlayItem it) async {
+    final t = await _askText(it.text);
+    if (t == null || t.isEmpty || !mounted) return;
+    setState(() => it.text = t);
+  }
+
+  void _delete(OverlayItem it) {
+    setState(() {
+      widget.items.remove(it);
+      if (_sel == it) _sel = null;
+    });
+  }
+
+  OverlayItem? _hit(Offset p, Size size) {
+    for (var i = widget.items.length - 1; i >= 0; i--) {
+      final it = widget.items[i];
+      if (!it.valid) continue;
+      final s = overlayItemSize(it, size);
+      final d = p - Offset(it.cx * size.width, it.cy * size.height);
+      final cosA = cos(-it.rotation);
+      final sinA = sin(-it.rotation);
+      final lx = d.dx * cosA - d.dy * sinA;
+      final ly = d.dx * sinA + d.dy * cosA;
+      const slack = 14.0;
+      if (lx.abs() <= s.width / 2 + slack && ly.abs() <= s.height / 2 + slack) return it;
+    }
+    return null;
+  }
+
+  Widget _preview(Size size) {
+    return ClipRect(
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: _backdrop != null
+                ? Image.file(_backdrop!, fit: BoxFit.cover)
+                : Container(color: kSurface),
+          ),
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapUp: (d) {
+                final hit = _hit(d.localPosition, size);
+                setState(() => _sel = hit);
+              },
+              onScaleStart: (d) {
+                final hit = _hit(d.localFocalPoint, size);
+                if (hit != null) setState(() => _sel = hit);
+                _active = hit ?? (d.pointerCount >= 2 ? _sel : null);
+                _lastCount = d.pointerCount;
+                _s0 = _active?.scale ?? 1;
+                _r0 = _active?.rotation ?? 0;
+              },
+              onScaleUpdate: (d) {
+                final it = _active;
+                if (it == null) return;
+                if (d.pointerCount != _lastCount) {
+                  _lastCount = d.pointerCount;
+                  _s0 = it.scale;
+                  _r0 = it.rotation;
+                  return;
+                }
+                setState(() {
+                  it.cx = (it.cx + d.focalPointDelta.dx / size.width).clamp(0.0, 1.0).toDouble();
+                  it.cy = (it.cy + d.focalPointDelta.dy / size.height).clamp(0.0, 1.0).toDouble();
+                  if (d.pointerCount >= 2) {
+                    it.scale = (_s0 * d.scale).clamp(0.2, 6.0).toDouble();
+                    it.rotation = _r0 + d.rotation;
+                  }
+                });
+              },
+              onScaleEnd: (_) => _active = null,
+              child: CustomPaint(
+                size: Size.infinite,
+                painter: _OverlayPainter(widget.items, _sel),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _slider(
+    String label,
+    double value,
+    double lo,
+    double hi,
+    ValueChanged<double> onChanged,
+    String shown,
+  ) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 64,
+          child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        ),
+        Expanded(
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: Slider(
+              min: lo,
+              max: hi,
+              value: value.clamp(lo, hi).toDouble(),
+              activeColor: kAccent,
+              onChanged: (v) => setState(() => onChanged(v)),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 44,
+          child: Text(
+            shown,
+            textAlign: TextAlign.end,
+            style: const TextStyle(fontSize: 11, color: Colors.white54),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _chipsRow(List<String> names, int current, void Function(int) onSel) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 4,
+      children: [
+        for (var i = 0; i < names.length; i++)
+          ChoiceChip(
+            label: Text(names[i], style: const TextStyle(fontSize: 12)),
+            selected: current == i,
+            selectedColor: kAccent,
+            onSelected: (_) => setState(() => onSel(i)),
+          ),
+      ],
+    );
+  }
+
+  Widget _controls(OverlayItem it) {
+    var deg = it.rotation * 180 / pi;
+    deg = ((deg + 180) % 360) - 180;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 10),
+        if (!it.isImage) ...[
+          Row(
+            children: [
+              TextButton.icon(
+                onPressed: () => _editText(it),
+                icon: const Icon(Icons.edit, size: 18, color: kAccent2),
+                label: const Text('تعديل النص', style: TextStyle(color: kAccent2)),
+              ),
+            ],
+          ),
+          Wrap(
+            spacing: 10,
+            children: [
+              for (final c in _colors)
+                GestureDetector(
+                  onTap: () => setState(() => it.color = c),
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: c,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: it.color == c ? kAccent2 : Colors.white24,
+                        width: it.color == c ? 3 : 1,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            activeColor: kAccent,
+            title: const Text('خلفية خلف الكتابة', style: TextStyle(fontSize: 13)),
+            value: it.box,
+            onChanged: (v) => setState(() => it.box = v),
+          ),
+        ] else ...[
+          _chipsRow(_shapeNames, it.shape, (v) => it.shape = v),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            activeColor: kAccent,
+            title: const Text('إطار أبيض', style: TextStyle(fontSize: 13)),
+            value: it.border,
+            onChanged: (v) => setState(() => it.border = v),
+          ),
+        ],
+        _slider('الحجم', it.scale, 0.2, 4.0, (v) => it.scale = v, '${(it.scale * 100).round()}%'),
+        _slider('التدوير', deg, -180, 180, (v) => it.rotation = v * pi / 180, '${deg.round()}°'),
+        _slider('الشفافية', it.opacity, 0.1, 1.0, (v) => it.opacity = v, '${(it.opacity * 100).round()}%'),
+        const SizedBox(height: 6),
+        const Text('وقت الظهور', style: TextStyle(fontSize: 12, color: Colors.white54)),
+        const SizedBox(height: 6),
+        _chipsRow(_timingNames, it.timing, (v) => it.timing = v),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: () => setState(() => it.cx = 0.5),
+                icon: const Icon(Icons.align_horizontal_center, size: 18, color: Colors.white70),
+                label: const Text('توسيط', style: TextStyle(color: Colors.white70)),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.redAccent)),
+                onPressed: () => _delete(it),
+                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
+                label: const Text('حذف', style: TextStyle(color: Colors.redAccent)),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _panel() {
+    final it = _sel;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(side: const BorderSide(color: kAccent)),
+                  onPressed: _addImage,
+                  icon: const Icon(Icons.add_photo_alternate, color: kAccent),
+                  label: const Text('صورة PiP'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(side: const BorderSide(color: kAccent2)),
+                  onPressed: _addText,
+                  icon: const Icon(Icons.text_fields, color: kAccent2),
+                  label: const Text('كتابة'),
+                ),
+              ),
+            ],
+          ),
+          if (it == null)
+            const Padding(
+              padding: EdgeInsets.only(top: 12),
+              child: Text(
+                'اضغط على أي عنصر في المعاينة عشان تعدّله.\n'
+                'اسحب بإصبع للتحريك • بإصبعين للتكبير والتدوير.',
+                style: TextStyle(fontSize: 12, color: Colors.white38, height: 1.5),
+              ),
+            )
+          else
+            _controls(it),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('محرر الصور والكتابة', style: TextStyle(fontSize: 16)),
+        backgroundColor: kBg,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('تم', style: TextStyle(color: kAccent, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            flex: 5,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: LayoutBuilder(
+                builder: (context, cons) {
+                  var pw = cons.maxWidth;
+                  var ph = pw / widget.aspect;
+                  if (ph > cons.maxHeight) {
+                    ph = cons.maxHeight;
+                    pw = ph * widget.aspect;
+                  }
+                  final size = Size(pw, ph);
+                  return Center(
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: Colors.white24)),
+                      child: SizedBox(width: pw, height: ph, child: _preview(size)),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+          Expanded(flex: 5, child: _panel()),
+        ],
+      ),
     );
   }
 }
@@ -557,7 +1342,6 @@ class ProjectPage extends StatefulWidget {
 class _ProjectPageState extends State<ProjectPage> {
   final _picker = ImagePicker();
   final List<SourceVideo> _sources = [];
-  final _textCtrl = TextEditingController();
 
   int _targetSec = 30;
   int _pace = 1; // 0 سريع / 1 متوسط / 2 هادئ
@@ -573,13 +1357,8 @@ class _ProjectPageState extends State<ProjectPage> {
   String? _musicPath;
   String? _musicName;
 
-  // الكتابة على الفيديو
-  bool _textOn = false;
-  String _textPos = 'bottom';
-  String _textSize = 'm';
-  String _textColor = 'white';
-  bool _textBox = true;
-  int _textTiming = 0; // 0 طوال الفيديو / 1 أول 5 ثواني / 2 آخر 5 ثواني
+  // صور PiP وكتابة حرة فوق الفيديو
+  final List<OverlayItem> _overlays = [];
 
   bool _busy = false;
   bool _picking = false;
@@ -611,21 +1390,6 @@ class _ProjectPageState extends State<ProjectPage> {
     '16:9': 'يوتيوب 16:9',
     '1:1': 'مربع 1:1',
   };
-  static const _textPosNames = {'top': 'أعلى', 'center': 'وسط', 'bottom': 'أسفل'};
-  static const _textSizeNames = {'s': 'صغير', 'm': 'متوسط', 'l': 'كبير'};
-  static const Map<String, Color> _textColors = {
-    'white': Colors.white,
-    'yellow': Color(0xFFFFE14D),
-    'pink': kAccent,
-    'green': Color(0xFF6BFF8A),
-    'cyan': Color(0xFF4DE1FF),
-  };
-
-  @override
-  void dispose() {
-    _textCtrl.dispose();
-    super.dispose();
-  }
 
   void _toast(String msg) {
     if (!mounted) return;
@@ -1274,7 +2038,7 @@ class _ProjectPageState extends State<ProjectPage> {
     return (cur, curL);
   }
 
-  /// الدمج النهائي: انتقالات + كتابة + موسيقى + فيد
+  /// الدمج النهائي: انتقالات + صور وكتابة + موسيقى + فيد
   Future<bool> _finalize({
     required List<String> files,
     required List<double> lens,
@@ -1282,13 +2046,12 @@ class _ProjectPageState extends State<ProjectPage> {
     required double total,
     required Random rng,
     required bool useOrig,
-    String? textPng,
+    required List<OverlayLayer> layers,
   }) async {
     final n = files.length;
     final hasMusic = _musicPath != null;
-    final hasText = textPng != null;
     final musicIdx = n;
-    final textIdx = hasMusic ? n + 1 : n;
+    final layerIdx = hasMusic ? n + 1 : n;
     final totalStr = total.toStringAsFixed(3);
 
     String build(List<String> trs) {
@@ -1299,20 +2062,15 @@ class _ProjectPageState extends State<ProjectPage> {
         inputs.write('-i "$f" ');
       }
       if (hasMusic) inputs.write('-stream_loop -1 -i "$_musicPath" ');
-      if (hasText) inputs.write('-loop 1 -framerate 30 -i "$textPng" ');
+      for (final l in layers) {
+        inputs.write('-loop 1 -framerate 30 -i "${l.png}" ');
+      }
 
       var vLabel = c.v;
-      if (hasText) {
-        var enable = '';
-        if (_textTiming == 1) {
-          enable = ":enable='lt(t,5)'";
-        } else if (_textTiming == 2) {
-          enable = ":enable='gt(t,${max(0.0, total - 5).toStringAsFixed(3)})'";
-        }
-        fc.add('[$textIdx:v]format=rgba[tx]');
-        fc.add('$vLabel[tx]overlay=0:0$enable[vt]');
-        vLabel = '[vt]';
-      }
+      final o = overlayFilters(layers, layerIdx, vLabel, total);
+      fc.addAll(o.fc);
+      vLabel = o.label;
+
       final fadeOutStart = max(0.0, total - 0.7).toStringAsFixed(3);
       fc.add('${vLabel}fade=t=in:st=0:d=0.5,fade=t=out:st=$fadeOutStart:d=0.7,format=yuv420p[vout]');
 
@@ -1343,66 +2101,6 @@ class _ProjectPageState extends State<ProjectPage> {
       ok = await _exec(build(List<String>.filled(n - 1, 'fade')), onTime: prog);
     }
     return ok;
-  }
-
-  // ───── الكتابة على الفيديو (صورة شفافة بتتعمل بفلاتر → بتدعم العربي) ─────
-
-  Future<String?> _makeTextPng(String path, int w, int h) async {
-    try {
-      final text = _textCtrl.text.trim();
-      if (text.isEmpty) return null;
-      final isRtl = RegExp(r'[\u0600-\u06FF]').hasMatch(text);
-      final base = min(w, h).toDouble();
-      final factor = _textSize == 's' ? 0.045 : (_textSize == 'l' ? 0.09 : 0.065);
-      final fs = base * factor;
-      final color = _textColors[_textColor] ?? Colors.white;
-
-      final tp = TextPainter(
-        text: TextSpan(
-          text: text,
-          style: TextStyle(
-            color: color,
-            fontSize: fs,
-            fontWeight: FontWeight.w800,
-            height: 1.3,
-            shadows: const [Shadow(color: Colors.black, blurRadius: 6, offset: Offset(0, 2))],
-          ),
-        ),
-        textAlign: TextAlign.center,
-        textDirection: isRtl ? TextDirection.rtl : TextDirection.ltr,
-      )..layout(maxWidth: w * 0.84);
-
-      final rec = ui.PictureRecorder();
-      final canvas = Canvas(rec, Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()));
-      final dx = (w - tp.width) / 2;
-      double dy;
-      if (_textPos == 'top') {
-        dy = h * 0.10;
-      } else if (_textPos == 'center') {
-        dy = (h - tp.height) / 2;
-      } else {
-        dy = h * 0.84 - tp.height;
-      }
-      if (_textBox) {
-        final pad = fs * 0.5;
-        canvas.drawRRect(
-          RRect.fromRectAndRadius(
-            Rect.fromLTWH(dx - pad, dy - pad * 0.6, tp.width + pad * 2, tp.height + pad * 1.2),
-            Radius.circular(pad),
-          ),
-          Paint()..color = const Color.fromARGB(140, 0, 0, 0),
-        );
-      }
-      tp.paint(canvas, Offset(dx, dy));
-      final pic = rec.endRecording();
-      final img = await pic.toImage(w, h);
-      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-      if (bd == null) return null;
-      await File(path).writeAsBytes(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
-      return path;
-    } catch (_) {
-      return null;
-    }
   }
 
   // ───── التشغيل الكامل ─────
@@ -1522,17 +2220,18 @@ class _ProjectPageState extends State<ProjectPage> {
       final (finalFiles, finalLens) = red;
       final total = finalLens.fold<double>(0, (a, b) => a + b) - (finalLens.length - 1) * _td;
 
-      // 6) الكتابة
-      String? textPng;
-      if (_textOn && _textCtrl.text.trim().isNotEmpty) {
-        textPng = await _makeTextPng('${tmp.path}/text.png', outW, outH);
-        if (textPng == null) warns.add('تعذر إنشاء الكتابة على الفيديو.');
+      // 6) الصور والكتابة
+      var layers = <OverlayLayer>[];
+      if (_overlays.any((e) => e.valid)) {
+        _set('تجهيز الصور والكتابة…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
+        layers = await buildOverlayLayers(_overlays, outW, outH, tmp.path);
+        if (layers.isEmpty) warns.add('تعذر إنشاء الصور/الكتابة على الفيديو.');
       }
 
       // 7) الدمج النهائي
       final dir = await montagesDir();
       final outPath = '${dir.path}/montage_${DateTime.now().millisecondsSinceEpoch}.mp4';
-      _set('الدمج النهائي (انتقالات + كتابة + موسيقى)…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
+      _set('الدمج النهائي (انتقالات + صور وكتابة + موسيقى)…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
       final useOrig = _keepOriginal && anyRealAudio;
       final ok = await _finalize(
         files: finalFiles,
@@ -1541,7 +2240,7 @@ class _ProjectPageState extends State<ProjectPage> {
         total: total,
         rng: rng,
         useOrig: useOrig,
-        textPng: textPng,
+        layers: layers,
       );
       if (_cancelled) throw 'cancel';
       if (!ok) throw 'فشل الدمج النهائي';
@@ -1624,13 +2323,6 @@ class _ProjectPageState extends State<ProjectPage> {
       subtitle: Text(sub, style: const TextStyle(fontSize: 11, color: Colors.white38)),
       value: value,
       onChanged: (v) => setState(() => onChanged(v)),
-    );
-  }
-
-  Widget _sub(String t) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 10, bottom: 6),
-      child: Text(t, style: const TextStyle(fontSize: 12, color: Colors.white54)),
     );
   }
 
@@ -1726,7 +2418,15 @@ class _ProjectPageState extends State<ProjectPage> {
                           ],
                         ),
                       ),
-                      _section('9) كتابة على الفيديو', _buildTextControls()),
+                      _section(
+                        '9) صور وكتابة فوق الفيديو',
+                        OverlaysCard(
+                          items: _overlays,
+                          aspect: _aspect,
+                          backdropVideo: _sources.isEmpty ? null : _sources.first.path,
+                          onChanged: () => setState(() {}),
+                        ),
+                      ),
                       _section('10) موسيقى (اختياري)', _buildMusic()),
                       const SizedBox(height: 70),
                     ],
@@ -1755,64 +2455,6 @@ class _ProjectPageState extends State<ProjectPage> {
           ),
         ),
       ),
-    );
-  }
-
-  Widget _buildTextControls() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _switch('إضافة كتابة', 'نص يظهر فوق الفيديو (يدعم العربي)', _textOn, (v) => _textOn = v),
-        if (_textOn) ...[
-          TextField(
-            controller: _textCtrl,
-            minLines: 1,
-            maxLines: 3,
-            decoration: InputDecoration(
-              hintText: 'اكتب النص هنا…',
-              filled: true,
-              fillColor: kSurface,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide.none,
-              ),
-            ),
-          ),
-          _sub('مكان الكتابة'),
-          _chips<String>(_textPosNames.keys.toList(), _textPos, (v) => _textPosNames[v]!, (v) => _textPos = v),
-          _sub('الحجم'),
-          _chips<String>(_textSizeNames.keys.toList(), _textSize, (v) => _textSizeNames[v]!, (v) => _textSize = v),
-          _sub('اللون'),
-          Wrap(
-            spacing: 10,
-            children: _textColors.entries
-                .map((e) => GestureDetector(
-                      onTap: () => setState(() => _textColor = e.key),
-                      child: Container(
-                        width: 34,
-                        height: 34,
-                        decoration: BoxDecoration(
-                          color: e.value,
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _textColor == e.key ? kAccent2 : Colors.white24,
-                            width: _textColor == e.key ? 3 : 1,
-                          ),
-                        ),
-                      ),
-                    ))
-                .toList(),
-          ),
-          _sub('وقت الظهور'),
-          _chips<int>(
-            [0, 1, 2],
-            _textTiming,
-            (v) => const ['طوال الفيديو', 'أول 5 ثواني', 'آخر 5 ثواني'][v],
-            (v) => _textTiming = v,
-          ),
-          _switch('خلفية خلف الكتابة', 'مربع شفاف غامق يوضّح النص', _textBox, (v) => _textBox = v),
-        ],
-      ],
     );
   }
 
@@ -1979,6 +2621,9 @@ class _SplitPageState extends State<SplitPage> {
   String _aspect = '16:9';
   bool _hd = false;
   bool _cover = true; // true = قص لملء المساحة / false = عرض كامل بخلفية سوداء
+
+  // صور PiP وكتابة حرة فوق الفيديو
+  final List<OverlayItem> _overlays = [];
 
   bool _busy = false;
   bool _picking = false;
@@ -2183,7 +2828,15 @@ class _SplitPageState extends State<SplitPage> {
 
   bool _plannedAudio() => _clips.any((c) => c.hasAudio && !c.muted);
 
-  String _buildCmd(List<List<int>> rects, int w, int h, double total, String out, bool withAudio) {
+  String _buildCmd(
+    List<List<int>> rects,
+    int w,
+    int h,
+    double total,
+    String out,
+    bool withAudio,
+    List<OverlayLayer> layers,
+  ) {
     final n = _clips.length;
     final totalStr = total.toStringAsFixed(3);
 
@@ -2191,6 +2844,10 @@ class _SplitPageState extends State<SplitPage> {
     for (final c in _clips) {
       // تكرار المقاطع الأقصر لحد ما الأطول يخلص
       inputs.write('-stream_loop -1 -i "${c.path}" ');
+    }
+    // طبقات الصور والكتابة (بعد مقاطع الفيديو في ترتيب المدخلات)
+    for (final l in layers) {
+      inputs.write('-loop 1 -framerate 30 -i "${l.png}" ');
     }
 
     final fc = <String>['color=c=black:s=${w}x$h:r=30[bg]'];
@@ -2202,7 +2859,9 @@ class _SplitPageState extends State<SplitPage> {
       fc.add('$prev[c$i]overlay=${rects[i][0]}:${rects[i][1]}[t$i]');
       prev = '[t$i]';
     }
-    fc.add('${prev}format=yuv420p[vout]');
+    final o = overlayFilters(layers, n, prev, total);
+    fc.addAll(o.fc);
+    fc.add('${o.label}format=yuv420p[vout]');
 
     // الصوت: دمج كل الأصوات غير المكتومة
     final audIdx = <int>[];
@@ -2250,6 +2909,10 @@ class _SplitPageState extends State<SplitPage> {
       notificationText: 'المعالجة مستمرة في الخلفية...',
     );
 
+    final tmpBase = await getTemporaryDirectory();
+    final tmp = Directory('${tmpBase.path}/split_${DateTime.now().millisecondsSinceEpoch}');
+    await tmp.create(recursive: true);
+
     String? resultPath;
     String? partialPath;
     try {
@@ -2262,23 +2925,31 @@ class _SplitPageState extends State<SplitPage> {
       final path = '${dir.path}/split_${DateTime.now().millisecondsSinceEpoch}.mp4';
       partialPath = path;
 
+      var layers = <OverlayLayer>[];
+      final wantOverlays = _overlays.any((e) => e.valid);
+      if (wantOverlays) {
+        _set('تجهيز الصور والكتابة…', 0);
+        layers = await buildOverlayLayers(_overlays, w, h, tmp.path);
+      }
+      final overlayFailed = wantOverlays && layers.isEmpty;
+
       _set('جاري دمج المقاطع في شاشة واحدة…', 0);
       void prog(int ms) => _setP(ms / (max(0.5, total) * 1000));
 
       final planned = _plannedAudio();
-      var ok = await _exec(_buildCmd(rects, w, h, total, path, true), onTime: prog);
+      var ok = await _exec(_buildCmd(rects, w, h, total, path, true, layers), onTime: prog);
       var dropped = false;
       if (!ok && !_cancelled && planned) {
-        ok = await _exec(_buildCmd(rects, w, h, total, path, false), onTime: prog);
+        ok = await _exec(_buildCmd(rects, w, h, total, path, false, layers), onTime: prog);
         dropped = ok;
       }
       if (_cancelled) throw 'cancel';
       if (!ok) throw 'فشل التصدير';
 
       resultPath = path;
-      final msg = dropped
-          ? 'تم! الفيديو جاهز 🎉\n⚠️ تعذر دمج الصوت، فالفيديو طلع صامت.'
-          : 'تم! الفيديو جاهز 🎉';
+      var msg = 'تم! الفيديو جاهز 🎉';
+      if (dropped) msg += '\n⚠️ تعذر دمج الصوت، فالفيديو طلع صامت.';
+      if (overlayFailed) msg += '\n⚠️ تعذر إنشاء الصور/الكتابة على الفيديو.';
       _set(msg, 1);
     } catch (e) {
       if (e != 'cancel' && mounted) setState(() => _errorDetail = _lastLog);
@@ -2291,6 +2962,9 @@ class _SplitPageState extends State<SplitPage> {
           if (f.existsSync()) f.deleteSync();
         } catch (_) {}
       }
+      try {
+        await tmp.delete(recursive: true);
+      } catch (_) {}
       if (mounted) setState(() => _busy = false);
     }
 
@@ -2397,6 +3071,15 @@ class _SplitPageState extends State<SplitPage> {
                           ],
                         ),
                       ),
+                      _section(
+                        '4) صور وكتابة فوق الفيديو',
+                        OverlaysCard(
+                          items: _overlays,
+                          aspect: _aspect,
+                          backdropVideo: _clips.isEmpty ? null : _clips.first.path,
+                          onChanged: () => setState(() {}),
+                        ),
+                      ),
                       _buildInfo(),
                       const SizedBox(height: 70),
                     ],
@@ -2410,433 +3093,4 @@ class _SplitPageState extends State<SplitPage> {
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
             child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: kAccent,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-              ),
-              onPressed: canStart ? _generate : null,
-              icon: const Icon(Icons.view_column, color: Colors.white),
-              label: const Text(
-                'ابدأ التقسيم ✨',
-                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInfo() {
-    if (_clips.length < 2) return const SizedBox.shrink();
-    final total = _clips.map((c) => c.duration).reduce(max);
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(12)),
-      child: Text(
-        'مدة الفيديو النهائي: ${fmtDur(total)} (أطول مقطع). المقاطع الأقصر هتتكرر لحد ما الأطول يخلص.\n'
-        'الأصوات كلها بتتدمج، وتقدر تكتم أي مقطع من زرار السماعة.',
-        style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
-      ),
-    );
-  }
-
-  Widget _buildPreview() {
-    final (w, h) = _outputSize();
-    final rects = _rects(_effLayout(), w, h);
-    return Center(
-      child: SizedBox(
-        height: 150,
-        child: AspectRatio(
-          aspectRatio: w / h,
-          child: LayoutBuilder(
-            builder: (context, cons) {
-              final sx = cons.maxWidth / w;
-              final sy = cons.maxHeight / h;
-              return Stack(
-                children: [
-                  for (var i = 0; i < rects.length; i++)
-                    Positioned(
-                      left: rects[i][0] * sx + 1,
-                      top: rects[i][1] * sy + 1,
-                      width: max(2.0, rects[i][2] * sx - 2),
-                      height: max(2.0, rects[i][3] * sy - 2),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: kSurface,
-                          border: Border.all(color: kAccent),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Center(
-                          child: Text(
-                            '${i + 1}',
-                            style: const TextStyle(fontWeight: FontWeight.bold, color: kAccent2),
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              );
-            },
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildClips() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (_clips.length < 3)
-          OutlinedButton.icon(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              side: const BorderSide(color: kAccent),
-            ),
-            onPressed: _picking ? null : _addVideo,
-            icon: _picking
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
-                  )
-                : const Icon(Icons.video_library, color: kAccent),
-            label: Text(_clips.isEmpty ? 'اختيار أول مقطع' : 'إضافة مقطع (${_clips.length}/3)'),
-          ),
-        for (var i = 0; i < _clips.length; i++) _clipCard(i),
-        if (_clips.length < 2)
-          const Padding(
-            padding: EdgeInsets.only(top: 8),
-            child: Text(
-              'اختار مقطعين على الأقل (والحد الأقصى 3).',
-              style: TextStyle(fontSize: 11, color: kAccent2),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _clipCard(int i) {
-    final c = _clips[i];
-    return Card(
-      color: kSurface,
-      margin: const EdgeInsets.only(top: 8),
-      child: ListTile(
-        dense: true,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 10),
-        leading: CircleAvatar(
-          radius: 14,
-          backgroundColor: kAccent,
-          child: Text('${i + 1}', style: const TextStyle(fontSize: 13, color: Colors.white)),
-        ),
-        title: Text(
-          c.name,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 13),
-        ),
-        subtitle: Text(
-          c.hasAudio ? fmtDur(c.duration) : '${fmtDur(c.duration)}  •  بدون صوت',
-          style: const TextStyle(fontSize: 11, color: Colors.grey),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (c.hasAudio)
-              IconButton(
-                visualDensity: VisualDensity.compact,
-                tooltip: c.muted ? 'تشغيل الصوت' : 'كتم الصوت',
-                icon: Icon(
-                  c.muted ? Icons.volume_off : Icons.volume_up,
-                  size: 22,
-                  color: c.muted ? Colors.redAccent : kAccent2,
-                ),
-                onPressed: () => setState(() => c.muted = !c.muted),
-              )
-            else
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 8),
-                child: Icon(Icons.volume_off, size: 22, color: Colors.white24),
-              ),
-            if (i > 0)
-              IconButton(
-                visualDensity: VisualDensity.compact,
-                tooltip: 'تقديم',
-                icon: const Icon(Icons.arrow_upward, size: 20, color: Colors.white54),
-                onPressed: () => _moveUp(i),
-              ),
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              tooltip: 'حذف',
-              icon: const Icon(Icons.close, size: 20, color: Colors.white54),
-              onPressed: () => setState(() => _clips.removeAt(i)),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusCard() {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(12)),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(_status, style: const TextStyle(fontSize: 13)),
-          if (_busy) ...[
-            const SizedBox(height: 10),
-            LinearProgressIndicator(
-              value: _progress > 0 ? _progress : null,
-              color: kAccent,
-              backgroundColor: Colors.white12,
-              minHeight: 6,
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Text('${(_progress * 100).toStringAsFixed(0)}%',
-                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
-                const Spacer(),
-                TextButton(
-                  onPressed: _cancel,
-                  child: const Text('إلغاء', style: TextStyle(color: Colors.redAccent)),
-                ),
-              ],
-            ),
-          ],
-          if (!_busy && _errorDetail.isNotEmpty)
-            Theme(
-              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-              child: ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: const Text(
-                  'تفاصيل تقنية (ابعتها لو الخطأ اتكرر)',
-                  style: TextStyle(fontSize: 11, color: Colors.white54),
-                ),
-                children: [
-                  SelectableText(
-                    _errorDetail,
-                    textDirection: TextDirection.ltr,
-                    style: const TextStyle(fontSize: 10, color: Colors.white54),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-// ───────────────────── Player ─────────────────────
-
-class PlayerPage extends StatefulWidget {
-  final File file;
-  final bool fromProject;
-  const PlayerPage({super.key, required this.file, required this.fromProject});
-
-  @override
-  State<PlayerPage> createState() => _PlayerPageState();
-}
-
-class _PlayerPageState extends State<PlayerPage> {
-  late VideoPlayerController _c;
-  bool _ready = false;
-  bool _busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _c = VideoPlayerController.file(widget.file);
-    _c.initialize().then((_) async {
-      if (!mounted) return;
-      await _c.setLooping(true);
-      await _c.play();
-      setState(() => _ready = true);
-    });
-    _c.addListener(() {
-      if (mounted) setState(() {});
-    });
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  Future<void> _save() async {
-    setState(() => _busy = true);
-    try {
-      if (!await Gal.hasAccess(toAlbum: true)) {
-        final granted = await Gal.requestAccess(toAlbum: true);
-        if (!granted) {
-          _toast('لازم توافق على إذن الوصول للمعرض');
-          return;
-        }
-      }
-      await Gal.putVideo(widget.file.path, album: 'SmartMontage');
-      _toast('تم الحفظ في المعرض (ألبوم SmartMontage)');
-    } catch (e) {
-      _toast('حدث خطأ أثناء الحفظ: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _share() async {
-    await Share.shareXFiles([XFile(widget.file.path)], text: 'مونتاج بالذكاء ✨');
-  }
-
-  Future<void> _delete() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: kSurface,
-        title: const Text('حذف المونتاج', style: TextStyle(fontSize: 16)),
-        content: const Text('هيتحذف نهائياً. متأكد؟'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('إلغاء', style: TextStyle(color: Colors.grey)),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('حذف', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    ThumbService.forget(widget.file);
-    try {
-      await widget.file.delete();
-    } catch (_) {}
-    if (mounted) Navigator.pop(context, 'deleted');
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final total = _c.value.duration.inMilliseconds.toDouble();
-    final pos = _c.value.position.inMilliseconds.toDouble().clamp(0.0, total <= 0 ? 1.0 : total).toDouble();
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        title: const Text('المونتاج', style: TextStyle(fontSize: 16)),
-        actions: [
-          IconButton(
-            tooltip: 'حذف',
-            icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-            onPressed: _delete,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Center(
-              child: !_ready
-                  ? const CircularProgressIndicator(color: kAccent)
-                  : GestureDetector(
-                      onTap: () => _c.value.isPlaying ? _c.pause() : _c.play(),
-                      child: Stack(
-                        alignment: Alignment.center,
-                        children: [
-                          AspectRatio(
-                            aspectRatio: _c.value.aspectRatio == 0 ? 9 / 16 : _c.value.aspectRatio,
-                            child: VideoPlayer(_c),
-                          ),
-                          if (!_c.value.isPlaying)
-                            const Icon(Icons.play_circle_fill, size: 64, color: Colors.white70),
-                        ],
-                      ),
-                    ),
-            ),
-          ),
-          Directionality(
-            textDirection: TextDirection.ltr,
-            child: Slider(
-              min: 0,
-              max: total <= 0 ? 1 : total,
-              value: pos,
-              activeColor: kAccent,
-              inactiveColor: Colors.white24,
-              onChanged: (v) => _c.seekTo(Duration(milliseconds: v.toInt())),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.amber,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                        ),
-                        onPressed: _busy ? null : _save,
-                        icon: const Icon(Icons.save_alt, color: Colors.black),
-                        label: const Text(
-                          'حفظ بالمعرض',
-                          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: kAccent,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                        ),
-                        onPressed: _share,
-                        icon: const Icon(Icons.share, color: Colors.white),
-                        label: const Text(
-                          'مشاركة',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                if (widget.fromProject) ...[
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        side: const BorderSide(color: kAccent2),
-                      ),
-                      onPressed: () => Navigator.pop(context, 'remix'),
-                      icon: const Icon(Icons.casino, color: kAccent2),
-                      label: const Text(
-                        'مونتاج جديد بنفس الفيديوهات 🎲',
-                        style: TextStyle(color: kAccent2),
-                      ),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+              style: ElevatedButton.styleFr
