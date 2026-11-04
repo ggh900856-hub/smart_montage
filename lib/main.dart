@@ -13,6 +13,7 @@ import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 const kBg = Color(0xFF0B0F1A);
@@ -20,9 +21,10 @@ const kSurface = Color(0xFF1A2236);
 const kAccent = Color(0xFFFF4D8D);
 const kAccent2 = Color(0xFFFFB84D);
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterForegroundTask.initCommunicationPort();
+  await WatermarkSettings.load();
   runApp(const MagicApp());
 }
 
@@ -118,6 +120,9 @@ class SourceVideo {
   List<double> scores = []; // درجة اهتمام كل ثانية (0..1)
   List<double> cuts = []; // أوقات تغيّر المشهد
 
+  /// كتابة وصور خاصة بالمقطع ده (في وضع تقسيم الشاشة)
+  final List<OverlayItem> overlays = [];
+
   SourceVideo({
     required this.path,
     required this.name,
@@ -142,6 +147,144 @@ class ClipPlan {
     required this.slow,
     required this.score,
   });
+}
+
+// ───────────────────── العلامة المائية الدائمة ─────────────────────
+
+/// إعدادات العلامة المائية: بتتحفظ على الجهاز وبتفضل لحد ما تغيّرها
+class WatermarkSettings {
+  static String? path;
+  static int corner = 3; // 0 أعلى يسار / 1 أعلى يمين / 2 أسفل يسار / 3 أسفل يمين / 4 منتصف
+  static double size = 0.18; // نسبة من عرض الفيديو
+  static double opacity = 0.85;
+  static double margin = 0.03; // نسبة من أصغر ضلع
+
+  static bool get hasImage => path != null && File(path!).existsSync();
+
+  static Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      path = p.getString('wm_path');
+      corner = p.getInt('wm_corner') ?? 3;
+      size = p.getDouble('wm_size') ?? 0.18;
+      opacity = p.getDouble('wm_opacity') ?? 0.85;
+      margin = p.getDouble('wm_margin') ?? 0.03;
+      if (path != null && !File(path!).existsSync()) path = null;
+    } catch (_) {}
+  }
+
+  static Future<void> save() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      if (path == null) {
+        await p.remove('wm_path');
+      } else {
+        await p.setString('wm_path', path!);
+      }
+      await p.setInt('wm_corner', corner);
+      await p.setDouble('wm_size', size);
+      await p.setDouble('wm_opacity', opacity);
+      await p.setDouble('wm_margin', margin);
+    } catch (_) {}
+  }
+
+  /// بينسخ الصورة لمجلد التطبيق عشان ما تضيعش لو اتمسحت من المعرض
+  static Future<bool> setImage(String src) async {
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/Watermark');
+      if (await dir.exists()) await dir.delete(recursive: true);
+      await dir.create(recursive: true);
+      var ext = src.contains('.') ? src.split('.').last.toLowerCase() : 'png';
+      if (ext.length > 4) ext = 'png';
+      final dest = '${dir.path}/wm_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      await File(src).copy(dest);
+      path = dest;
+      await save();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> clear() async {
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/Watermark');
+      if (await dir.exists()) await dir.delete(recursive: true);
+    } catch (_) {}
+    path = null;
+    await save();
+  }
+}
+
+/// رسم العلامة المائية (نفس الدالة في المعاينة وفي التصدير)
+void paintWatermark(Canvas canvas, Size frame, ui.Image img) {
+  final minSide = min(frame.width, frame.height);
+  var w = frame.width * WatermarkSettings.size;
+  var h = w * img.height / img.width;
+  final maxH = frame.height * 0.5;
+  if (h > maxH) {
+    h = maxH;
+    w = h * img.width / img.height;
+  }
+  final m = minSide * WatermarkSettings.margin;
+  double x;
+  double y;
+  switch (WatermarkSettings.corner) {
+    case 0:
+      x = m;
+      y = m;
+      break;
+    case 1:
+      x = frame.width - w - m;
+      y = m;
+      break;
+    case 2:
+      x = m;
+      y = frame.height - h - m;
+      break;
+    case 3:
+      x = frame.width - w - m;
+      y = frame.height - h - m;
+      break;
+    default:
+      x = (frame.width - w) / 2;
+      y = (frame.height - h) / 2;
+  }
+  canvas.drawImageRect(
+    img,
+    Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+    Rect.fromLTWH(x, y, w, h),
+    Paint()
+      ..filterQuality = FilterQuality.high
+      ..color = Color.fromRGBO(255, 255, 255, WatermarkSettings.opacity),
+  );
+}
+
+/// بيرسم العلامة المائية في PNG شفاف بحجم الفيديو
+Future<OverlayLayer?> buildWatermarkLayer(int w, int h, String dir) async {
+  if (!WatermarkSettings.hasImage) return null;
+  final img = await loadUiImage(WatermarkSettings.path!);
+  if (img == null) return null;
+  try {
+    final size = Size(w.toDouble(), h.toDouble());
+    final rec = ui.PictureRecorder();
+    final canvas = Canvas(rec, Offset.zero & size);
+    paintWatermark(canvas, size, img);
+    final pic = rec.endRecording();
+    final out = await pic.toImage(w, h);
+    final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+    out.dispose();
+    if (bd == null) return null;
+    final path = '$dir/watermark_layer.png';
+    await File(path).writeAsBytes(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
+    return OverlayLayer(path, 0);
+  } catch (_) {
+    return null;
+  } finally {
+    img.dispose();
+  }
 }
 
 // ───────────────────── الستايلات (20 ستايل + بدون + مزيج) ─────────────────────
@@ -333,7 +476,7 @@ class VideoThumb extends StatelessWidget {
 // ───────────────────── الطبقات: صور PiP + كتابة حرة ─────────────────────
 
 /// عنصر فوق الفيديو (صورة أو كتابة). الإحداثيات نسب من 0 لـ 1 من حجم الفيديو
-/// فبتتطبق بنفس المكان بالظبط على أي جودة أو أبعاد.
+/// (أو حجم الخانة في تقسيم الشاشة) فبتتطبق بنفس المكان بالظبط على أي جودة أو أبعاد.
 class OverlayItem {
   final bool isImage;
   ui.Image? image;
@@ -490,19 +633,26 @@ void paintOverlayItem(Canvas canvas, Size frame, OverlayItem it) {
   canvas.restore();
 }
 
+/// طبقة PNG شفافة جاهزة للتركيب. (x, y) مكانها على الفيديو النهائي
 class OverlayLayer {
   final String png;
   final int timing;
-  const OverlayLayer(this.png, this.timing);
+  final int x;
+  final int y;
+  const OverlayLayer(this.png, this.timing, [this.x = 0, this.y = 0]);
 }
 
-/// بيرسم كل العناصر في صور شفافة بحجم الفيديو (صورة لكل وقت ظهور)
+/// بيرسم كل العناصر في صور شفافة (صورة لكل وقت ظهور).
+/// الحجم (w, h) هو حجم الفيديو كله أو حجم خانة معينة، و(x, y) مكانها.
 Future<List<OverlayLayer>> buildOverlayLayers(
   List<OverlayItem> items,
   int w,
   int h,
-  String dir,
-) async {
+  String dir, {
+  String tag = '',
+  int x = 0,
+  int y = 0,
+}) async {
   final out = <OverlayLayer>[];
   final size = Size(w.toDouble(), h.toDouble());
   for (var t = 0; t < 3; t++) {
@@ -519,9 +669,9 @@ Future<List<OverlayLayer>> buildOverlayLayers(
       final bd = await img.toByteData(format: ui.ImageByteFormat.png);
       img.dispose();
       if (bd == null) continue;
-      final path = '$dir/overlay_$t.png';
+      final path = '$dir/overlay_${tag}_$t.png';
       await File(path).writeAsBytes(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
-      out.add(OverlayLayer(path, t));
+      out.add(OverlayLayer(path, t, x, y));
     } catch (_) {}
   }
   return out;
@@ -545,7 +695,7 @@ Future<List<OverlayLayer>> buildOverlayLayers(
       enable = ":enable='gt(t,${max(0.0, total - 5).toStringAsFixed(3)})'";
     }
     fc.add('[$idx:v]format=rgba[ov$i]');
-    fc.add('$cur[ov$i]overlay=0:0$enable[ot$i]');
+    fc.add('$cur[ov$i]overlay=${layers[i].x}:${layers[i].y}$enable[ot$i]');
     cur = '[ot$i]';
   }
   return (fc: fc, label: cur);
@@ -654,17 +804,19 @@ class OverlaysCard extends StatelessWidget {
   }
 }
 
-/// محرر الطبقات: معاينة بنسبة الفيديو النهائي، اسحب وكبّر وكتابة حرة
+/// محرر الطبقات: معاينة بنسبة الفيديو النهائي (أو الخانة)، اسحب وكبّر وكتابة حرة
 class OverlayEditorPage extends StatefulWidget {
   final List<OverlayItem> items;
   final double aspect;
   final String? backdropVideo;
+  final String title;
 
   const OverlayEditorPage({
     super.key,
     required this.items,
     required this.aspect,
     this.backdropVideo,
+    this.title = 'محرر الصور والكتابة',
   });
 
   @override
@@ -1063,7 +1215,7 @@ class _OverlayEditorPageState extends State<OverlayEditorPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('محرر الصور والكتابة', style: TextStyle(fontSize: 16)),
+        title: Text(widget.title, style: const TextStyle(fontSize: 16)),
         backgroundColor: kBg,
         actions: [
           TextButton(
@@ -1102,6 +1254,270 @@ class _OverlayEditorPageState extends State<OverlayEditorPage> {
       ),
     );
   }
+}
+
+// ───────────────────── صفحة إعدادات العلامة المائية ─────────────────────
+
+class _WmPreviewPainter extends CustomPainter {
+  final ui.Image? img;
+  _WmPreviewPainter(this.img);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.clipRect(Offset.zero & size);
+    final i = img;
+    if (i != null) paintWatermark(canvas, size, i);
+  }
+
+  @override
+  bool shouldRepaint(covariant _WmPreviewPainter oldDelegate) => true;
+}
+
+class WatermarkPage extends StatefulWidget {
+  const WatermarkPage({super.key});
+
+  @override
+  State<WatermarkPage> createState() => _WatermarkPageState();
+}
+
+class _WatermarkPageState extends State<WatermarkPage> {
+  final _picker = ImagePicker();
+  ui.Image? _img;
+  String _aspect = '9:16';
+  bool _busy = false;
+
+  static const _cornerNames = ['أعلى يسار', 'أعلى يمين', 'أسفل يسار', 'أسفل يمين', 'المنتصف'];
+  static const _aspects = {
+    '9:16': 'ريلز 9:16',
+    '16:9': 'يوتيوب 16:9',
+    '1:1': 'مربع 1:1',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  @override
+  void dispose() {
+    _img?.dispose();
+    super.dispose();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _reload() async {
+    ui.Image? img;
+    if (WatermarkSettings.hasImage) {
+      img = await loadUiImage(WatermarkSettings.path!);
+    }
+    if (!mounted) {
+      img?.dispose();
+      return;
+    }
+    final old = _img;
+    setState(() => _img = img);
+    old?.dispose();
+  }
+
+  Future<void> _pick() async {
+    final x = await _picker.pickImage(source: ImageSource.gallery);
+    if (x == null) return;
+    setState(() => _busy = true);
+    final ok = await WatermarkSettings.setImage(x.path);
+    if (!ok) _toast('تعذر حفظ الصورة دي');
+    await _reload();
+    if (mounted) setState(() => _busy = false);
+  }
+
+  Future<void> _remove() async {
+    await WatermarkSettings.clear();
+    await _reload();
+  }
+
+  Widget _slider(
+    String label,
+    double value,
+    double lo,
+    double hi,
+    ValueChanged<double> onChanged,
+    String shown,
+  ) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 64,
+          child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        ),
+        Expanded(
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: Slider(
+              min: lo,
+              max: hi,
+              value: value.clamp(lo, hi).toDouble(),
+              activeColor: kAccent,
+              onChanged: (v) => setState(() => onChanged(v)),
+              onChangeEnd: (_) => WatermarkSettings.save(),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 44,
+          child: Text(
+            shown,
+            textAlign: TextAlign.end,
+            style: const TextStyle(fontSize: 11, color: Colors.white54),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final has = WatermarkSettings.hasImage;
+    return Scaffold(
+      appBar: AppBar(title: const Text('العلامة المائية'), backgroundColor: kBg),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'اختار العلامة ومكانها مرة واحدة، وهتتحط تلقائياً على كل المونتاجات '
+            'وتقسيم الشاشة لحد ما تغيّرها.',
+            style: TextStyle(fontSize: 12, color: Colors.white54, height: 1.5),
+          ),
+          const SizedBox(height: 14),
+          Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 280),
+              child: AspectRatio(
+                aspectRatio: aspectOf(_aspect),
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.white24),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xFF2B3550), Color(0xFF111726)],
+                    ),
+                  ),
+                  child: CustomPaint(
+                    size: Size.infinite,
+                    painter: _WmPreviewPainter(_img),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final e in _aspects.entries)
+                ChoiceChip(
+                  label: Text(e.value, style: const TextStyle(fontSize: 12)),
+                  selected: _aspect == e.key,
+                  selectedColor: kAccent,
+                  onSelected: (_) => setState(() => _aspect = e.key),
+                ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    side: const BorderSide(color: kAccent),
+                  ),
+                  onPressed: _busy ? null : _pick,
+                  icon: _busy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+                        )
+                      : const Icon(Icons.add_photo_alternate, color: kAccent),
+                  label: Text(has ? 'تغيير الصورة' : 'اختيار صورة'),
+                ),
+              ),
+              if (has) ...[
+                const SizedBox(width: 10),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    side: const BorderSide(color: Colors.redAccent),
+                  ),
+                  onPressed: _busy ? null : _remove,
+                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                  label: const Text('إزالة', style: TextStyle(color: Colors.redAccent)),
+                ),
+              ],
+            ],
+          ),
+          if (has) ...[
+            const SizedBox(height: 16),
+            const Text(
+              'المكان الثابت',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: kAccent),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                for (var i = 0; i < _cornerNames.length; i++)
+                  ChoiceChip(
+                    label: Text(_cornerNames[i], style: const TextStyle(fontSize: 12)),
+                    selected: WatermarkSettings.corner == i,
+                    selectedColor: kAccent,
+                    onSelected: (_) {
+                      setState(() => WatermarkSettings.corner = i);
+                      WatermarkSettings.save();
+                    },
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            _slider('الحجم', WatermarkSettings.size, 0.05, 0.5, (v) => WatermarkSettings.size = v,
+                '${(WatermarkSettings.size * 100).round()}%'),
+            _slider('الشفافية', WatermarkSettings.opacity, 0.1, 1.0, (v) => WatermarkSettings.opacity = v,
+                '${(WatermarkSettings.opacity * 100).round()}%'),
+            _slider('الهامش', WatermarkSettings.margin, 0.0, 0.1, (v) => WatermarkSettings.margin = v,
+                '${(WatermarkSettings.margin * 100).round()}%'),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// سويتش بيظهر في صفحة المونتاج وتقسيم الشاشة لتفعيل/تعطيل العلامة لمونتاج معين
+Widget watermarkSwitch(bool value, void Function(bool) onChanged) {
+  if (!WatermarkSettings.hasImage) {
+    return const Text(
+      'مفيش علامة مائية محفوظة. تقدر تضيفها من الصفحة الرئيسية (العلامة المائية).',
+      style: TextStyle(fontSize: 11, color: Colors.white38),
+    );
+  }
+  return SwitchListTile(
+    contentPadding: EdgeInsets.zero,
+    activeColor: kAccent,
+    title: const Text('إضافة العلامة المائية', style: TextStyle(fontSize: 14)),
+    subtitle: const Text(
+      'بمكانها وحجمها المحفوظين من الصفحة الرئيسية',
+      style: TextStyle(fontSize: 11, color: Colors.white38),
+    ),
+    value: value,
+    onChanged: onChanged,
+  );
 }
 
 // ───────────────────────── Home ─────────────────────────
@@ -1171,6 +1587,11 @@ class _HomePageState extends State<HomePage> {
     _load();
   }
 
+  Future<void> _openWatermark() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => const WatermarkPage()));
+    if (mounted) setState(() {});
+  }
+
   Future<void> _open(File f) async {
     await Navigator.push<String>(
       context,
@@ -1185,6 +1606,35 @@ class _HomePageState extends State<HomePage> {
       await f.delete();
     } catch (_) {}
     _load();
+  }
+
+  Widget _watermarkCard() {
+    final has = WatermarkSettings.hasImage;
+    return Card(
+      color: kSurface,
+      margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ListTile(
+        onTap: _openWatermark,
+        leading: has
+            ? ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  width: 42,
+                  height: 42,
+                  color: Colors.black26,
+                  child: Image.file(File(WatermarkSettings.path!), fit: BoxFit.contain),
+                ),
+              )
+            : const Icon(Icons.branding_watermark, color: kAccent2),
+        title: const Text('العلامة المائية', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+        subtitle: Text(
+          has ? 'مفعّلة • ثابتة على كل الفيديوهات' : 'لسه ما اخترتش علامة',
+          style: const TextStyle(fontSize: 11, color: Colors.white54),
+        ),
+        trailing: const Icon(Icons.chevron_left, color: Colors.white54),
+      ),
+    );
   }
 
   @override
@@ -1255,6 +1705,8 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
+            const SizedBox(height: 12),
+            _watermarkCard(),
             const Divider(height: 36, color: Colors.white12),
             const Text(
               'مونتاجاتك:',
@@ -1354,6 +1806,7 @@ class _ProjectPageState extends State<ProjectPage> {
   bool _slowmo = true;
   bool _pan = true;
   bool _keepOriginal = true;
+  bool _useWm = true; // تطبيق العلامة المائية الدائمة
   String? _musicPath;
   String? _musicName;
 
@@ -2038,7 +2491,7 @@ class _ProjectPageState extends State<ProjectPage> {
     return (cur, curL);
   }
 
-  /// الدمج النهائي: انتقالات + صور وكتابة + موسيقى + فيد
+  /// الدمج النهائي: انتقالات + صور وكتابة + علامة مائية + موسيقى + فيد
   Future<bool> _finalize({
     required List<String> files,
     required List<double> lens,
@@ -2220,12 +2673,22 @@ class _ProjectPageState extends State<ProjectPage> {
       final (finalFiles, finalLens) = red;
       final total = finalLens.fold<double>(0, (a, b) => a + b) - (finalLens.length - 1) * _td;
 
-      // 6) الصور والكتابة
-      var layers = <OverlayLayer>[];
+      // 6) الصور والكتابة + العلامة المائية (العلامة دايماً آخر طبقة فوق كل حاجة)
+      final layers = <OverlayLayer>[];
       if (_overlays.any((e) => e.valid)) {
         _set('تجهيز الصور والكتابة…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
-        layers = await buildOverlayLayers(_overlays, outW, outH, tmp.path);
-        if (layers.isEmpty) warns.add('تعذر إنشاء الصور/الكتابة على الفيديو.');
+        final ol = await buildOverlayLayers(_overlays, outW, outH, tmp.path, tag: 'g');
+        if (ol.isEmpty) warns.add('تعذر إنشاء الصور/الكتابة على الفيديو.');
+        layers.addAll(ol);
+      }
+      if (_useWm && WatermarkSettings.hasImage) {
+        _set('تجهيز العلامة المائية…', _mStart + _mW * (_stepsDone / max(1, _stepsTotal)));
+        final wl = await buildWatermarkLayer(outW, outH, tmp.path);
+        if (wl == null) {
+          warns.add('تعذر إضافة العلامة المائية.');
+        } else {
+          layers.add(wl);
+        }
       }
 
       // 7) الدمج النهائي
@@ -2427,7 +2890,11 @@ class _ProjectPageState extends State<ProjectPage> {
                           onChanged: () => setState(() {}),
                         ),
                       ),
-                      _section('10) موسيقى (اختياري)', _buildMusic()),
+                      _section(
+                        '10) العلامة المائية',
+                        watermarkSwitch(_useWm, (v) => setState(() => _useWm = v)),
+                      ),
+                      _section('11) موسيقى (اختياري)', _buildMusic()),
                       const SizedBox(height: 70),
                     ],
                   ),
@@ -2621,8 +3088,9 @@ class _SplitPageState extends State<SplitPage> {
   String _aspect = '16:9';
   bool _hd = false;
   bool _cover = true; // true = قص لملء المساحة / false = عرض كامل بخلفية سوداء
+  bool _useWm = true; // تطبيق العلامة المائية الدائمة
 
-  // صور PiP وكتابة حرة فوق الفيديو
+  // عناصر عامة فوق الفيديو كله (اختياري). كل مقطع له عناصره الخاصة جوه SourceVideo.overlays
   final List<OverlayItem> _overlays = [];
 
   bool _busy = false;
@@ -2779,6 +3247,26 @@ class _SplitPageState extends State<SplitPage> {
     });
   }
 
+  /// يفتح محرر الكتابة والصور الخاص بالمقطع ده بنسبة خانته بالظبط
+  Future<void> _editClip(int i) async {
+    final (w, h) = _outputSize();
+    final rects = _rects(_effLayout(), w, h);
+    if (i >= rects.length) return;
+    final r = rects[i];
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OverlayEditorPage(
+          items: _clips[i].overlays,
+          aspect: r[2] / r[3],
+          backdropVideo: _clips[i].path,
+          title: 'كتابة وصور المقطع ${i + 1}',
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
   // ───── FFmpeg ─────
 
   Future<bool> _exec(String cmd, {void Function(int ms)? onTime}) async {
@@ -2845,7 +3333,7 @@ class _SplitPageState extends State<SplitPage> {
       // تكرار المقاطع الأقصر لحد ما الأطول يخلص
       inputs.write('-stream_loop -1 -i "${c.path}" ');
     }
-    // طبقات الصور والكتابة (بعد مقاطع الفيديو في ترتيب المدخلات)
+    // الطبقات (كتابة كل خانة + العامة + العلامة المائية) بعد مقاطع الفيديو في ترتيب المدخلات
     for (final l in layers) {
       inputs.write('-loop 1 -framerate 30 -i "${l.png}" ');
     }
@@ -2925,13 +3413,39 @@ class _SplitPageState extends State<SplitPage> {
       final path = '${dir.path}/split_${DateTime.now().millisecondsSinceEpoch}.mp4';
       partialPath = path;
 
-      var layers = <OverlayLayer>[];
-      final wantOverlays = _overlays.any((e) => e.valid);
+      // الطبقات: كتابة كل خانة (بحجم الخانة ومكانها) ← العامة ← العلامة المائية فوق الكل
+      final layers = <OverlayLayer>[];
+      final wantOverlays = _overlays.any((e) => e.valid) || _clips.any((c) => c.overlays.any((e) => e.valid));
       if (wantOverlays) {
         _set('تجهيز الصور والكتابة…', 0);
-        layers = await buildOverlayLayers(_overlays, w, h, tmp.path);
+        for (var i = 0; i < _clips.length; i++) {
+          if (!_clips[i].overlays.any((e) => e.valid)) continue;
+          layers.addAll(await buildOverlayLayers(
+            _clips[i].overlays,
+            rects[i][2],
+            rects[i][3],
+            tmp.path,
+            tag: 'c$i',
+            x: rects[i][0],
+            y: rects[i][1],
+          ));
+        }
+        if (_overlays.any((e) => e.valid)) {
+          layers.addAll(await buildOverlayLayers(_overlays, w, h, tmp.path, tag: 'g'));
+        }
       }
       final overlayFailed = wantOverlays && layers.isEmpty;
+
+      var wmFailed = false;
+      if (_useWm && WatermarkSettings.hasImage) {
+        _set('تجهيز العلامة المائية…', 0);
+        final wl = await buildWatermarkLayer(w, h, tmp.path);
+        if (wl == null) {
+          wmFailed = true;
+        } else {
+          layers.add(wl);
+        }
+      }
 
       _set('جاري دمج المقاطع في شاشة واحدة…', 0);
       void prog(int ms) => _setP(ms / (max(0.5, total) * 1000));
@@ -2950,6 +3464,7 @@ class _SplitPageState extends State<SplitPage> {
       var msg = 'تم! الفيديو جاهز 🎉';
       if (dropped) msg += '\n⚠️ تعذر دمج الصوت، فالفيديو طلع صامت.';
       if (overlayFailed) msg += '\n⚠️ تعذر إنشاء الصور/الكتابة على الفيديو.';
+      if (wmFailed) msg += '\n⚠️ تعذر إضافة العلامة المائية.';
       _set(msg, 1);
     } catch (e) {
       if (e != 'cancel' && mounted) setState(() => _errorDetail = _lastLog);
@@ -3031,7 +3546,7 @@ class _SplitPageState extends State<SplitPage> {
                   child: ListView(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                     children: [
-                      _section('1) المقاطع (2 أو 3)', _buildClips()),
+                      _section('1) المقاطع (2 أو 3) — ولكل مقطع كتابته الخاصة', _buildClips()),
                       _section(
                         '2) شكل التقسيم',
                         Column(
@@ -3072,13 +3587,17 @@ class _SplitPageState extends State<SplitPage> {
                         ),
                       ),
                       _section(
-                        '4) صور وكتابة فوق الفيديو',
+                        '4) صور وكتابة فوق الفيديو كله (اختياري)',
                         OverlaysCard(
                           items: _overlays,
                           aspect: _aspect,
                           backdropVideo: _clips.isEmpty ? null : _clips.first.path,
                           onChanged: () => setState(() {}),
                         ),
+                      ),
+                      _section(
+                        '5) العلامة المائية',
+                        watermarkSwitch(_useWm, (v) => setState(() => _useWm = v)),
                       ),
                       _buildInfo(),
                       const SizedBox(height: 70),
@@ -3093,7 +3612,7 @@ class _SplitPageState extends State<SplitPage> {
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
             child: ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
+              style: ElevatedButton.styleFrom(
                 backgroundColor: kAccent,
                 padding: const EdgeInsets.symmetric(vertical: 16),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -3202,12 +3721,25 @@ class _SplitPageState extends State<SplitPage> {
                 style: const TextStyle(fontSize: 13),
               ),
               subtitle: Text(
-                fmtDur(_clips[i].duration),
+                () {
+                  final n = _clips[i].overlays.where((e) => e.valid).length;
+                  return n == 0 ? fmtDur(_clips[i].duration) : '${fmtDur(_clips[i].duration)}  •  $n عناصر';
+                }(),
                 style: const TextStyle(fontSize: 11, color: Colors.grey),
               ),
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'كتابة وصور المقطع',
+                    icon: Icon(
+                      Icons.text_fields,
+                      size: 20,
+                      color: _clips[i].overlays.any((e) => e.valid) ? kAccent2 : Colors.white54,
+                    ),
+                    onPressed: () => _editClip(i),
+                  ),
                   if (_clips[i].hasAudio)
                     IconButton(
                       visualDensity: VisualDensity.compact,
